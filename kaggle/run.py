@@ -15,7 +15,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 PORT = int(os.environ.get("PORT", "7860"))
-MARK = Path("/tmp/.clone_deps_ok_v2")
+MARK = Path("/tmp/.clone_deps_ok_v3")
 
 
 def log(*a):
@@ -55,15 +55,33 @@ def check_gpus():
     return len(out)
 
 
+def _torch_constraints():
+    """锁定 Kaggle 自带的 torch 系列版本,防止 pip 升级 torch 后与 GPU 驱动不匹配。"""
+    out = subprocess.run([sys.executable, "-m", "pip", "freeze"], capture_output=True, text=True).stdout.splitlines()
+    keep = [l for l in out if re.match(r"^(torch|torchvision|torchaudio)==", l, re.I)]
+    f = Path("/tmp/torch_constraints.txt")
+    f.write_text("\n".join(keep) + "\n")
+    log("锁定:", ", ".join(keep) or "(无)")
+    return f
+
+
 def install_deps():
+    base = "fastapi 'uvicorn[standard]' python-multipart soundfile scipy noisereduce accelerate huggingface_hub"
     if MARK.exists():
         log("依赖已安装,跳过")
     else:
-        sh(
-            "pip install -q qwen-tts fastapi 'uvicorn[standard]' python-multipart soundfile scipy "
-            "noisereduce accelerate pillow huggingface_hub"
-        )
+        c = _torch_constraints()
+        # 首选 faster-qwen3-tts: CUDA Graph + 流式输出 (T4 上 RTF 约 2x 提升,首块音频约 1 秒)
+        r = sh("pip install -q -c %s faster-qwen3-tts %s" % (c, base), check=False)
+        if r.returncode != 0:
+            log("⚠ faster-qwen3-tts 安装失败,回退官方 qwen-tts(整句合成,首声会慢)")
+            sh("pip install -q -c %s qwen-tts %s" % (c, base))
         MARK.write_text("ok")
+    chk = subprocess.run([sys.executable, "-c", "import faster_qwen3_tts"], capture_output=True, text=True)
+    if chk.returncode == 0:
+        log("✓ faster-qwen3-tts 可用(CUDA Graph 流式)")
+    else:
+        log("faster-qwen3-tts 不可用,将使用官方 qwen-tts:", (chk.stderr.strip().splitlines() or ["?"])[-1])
     if not shutil.which("ffmpeg"):
         log("未找到 ffmpeg,尝试安装(浏览器录音 webm 需要它)")
         sh("apt-get install -y -qq ffmpeg > /dev/null 2>&1", check=False)
@@ -91,7 +109,7 @@ def predownload():
 
     from server import config
 
-    repos = [config.TTS_MODEL, config.LLM_MODEL, config.ASR_MODEL, config.SV_MODEL, config.DET_MODEL]
+    repos = [config.TTS_MODEL, config.LLM_MODEL, config.ASR_MODEL, config.SV_MODEL]
 
     def dl(r):
         t = time.time()
@@ -101,7 +119,7 @@ def predownload():
         except Exception as e:  # noqa: BLE001
             log("✗ 下载失败 %s: %s" % (r, e))
 
-    with ThreadPoolExecutor(5) as ex:
+    with ThreadPoolExecutor(4) as ex:
         list(ex.map(dl, repos))
 
 
