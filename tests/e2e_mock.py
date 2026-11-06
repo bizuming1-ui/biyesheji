@@ -1,5 +1,5 @@
 """端到端自检(Mock 模式,无需 GPU):  python tests/e2e_mock.py
-验证: 启动 → 训练(双卡) → 流式对话 → 音频顺序/无缺口 → 停止 → ASR → 检测 → 前端页面。"""
+验证: 启动 → 训练(双卡) → 流式对话 → 音频顺序/无缺口 → 停止 → ASR → 错误必回显 → 前端页面(无摄像头)。"""
 import asyncio
 import io
 import json
@@ -159,8 +159,12 @@ def main():
 
         a = c.post("/api/asr", content=make_ref(), headers={"content-type": "application/octet-stream"})
         check("asr works", a.status_code == 200 and a.json().get("text"), a.text[:100])
-        d = c.post("/api/detect?labels=杯子,keyboard&thr=0.2", content=b"\xff\xd8fake")
-        check("detect works", d.status_code == 200 and d.json()["boxes"], d.text[:100])
+        check("camera/detect removed", c.post("/api/detect", content=b"x").status_code in (404, 405) and "getUserMedia({ video" not in page.text and "摄像头" not in page.text)
+        # 关键回归: LLM 出错时界面必须收到明确的 error,而不是永远转圈
+        fr4, tx4, done4, _ = asyncio.run(chat("__LLM_FAIL__ 你好", ws_url))
+        check("LLM failure is reported (never silent)", done4 and done4["type"] == "error" and "LLM" in done4.get("text", ""), done4)
+        fr5, tx5, done5, _ = asyncio.run(chat("故障之后还能正常聊天", ws_url))
+        check("chat works after a failed turn", done5 and done5["type"] == "done", done5)
     finally:
         p.terminate()
         try:
