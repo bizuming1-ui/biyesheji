@@ -15,9 +15,10 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, Web
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 
-from . import config
+from . import config, diag
 from .engine import Engine, pack_audio
 
+diag.install()  # 把服务端日志同时复制进检测日志缓冲(输出框照常显示)
 engine = Engine()
 
 
@@ -70,6 +71,26 @@ async def reload_models():
     """某个模型加载失败时,界面上的「重新加载模型」按钮调用它(不用重启整个 Kaggle 单元格)。"""
     names = engine.reload_failed()
     return {"ok": True, "reloading": names}
+
+
+@app.get("/api/diag")
+async def diag_snapshot():
+    """检测日志:完整参数快照(版本/GPU/进程/配置/训练任务/服务端日志)。永不抛异常。"""
+    return await asyncio.to_thread(diag.collect, engine)
+
+
+@app.post("/api/clientlog")
+async def client_log(request: Request):
+    """网页端把关键事件(请求耗时/失败/错误)上报到服务端,一起出现在检测日志里。"""
+    try:
+        body = await request.json()
+        items = body if isinstance(body, list) else [body]
+        for it in items[:50]:
+            if isinstance(it, dict):
+                diag.add_client(it)
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True}
 
 
 @app.get("/favicon.ico")
