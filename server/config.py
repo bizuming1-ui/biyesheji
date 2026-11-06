@@ -52,6 +52,11 @@ LLM_SPLIT = os.environ.get("LLM_SPLIT", "1") == "1"
 LLM_MAX_MEM_GIB = float(os.environ.get("LLM_MAX_MEM_GIB", "4.6"))
 TTS_LOAD_RETRIES = int(os.environ.get("TTS_LOAD_RETRIES", "2"))
 
+# 采样参数:温度越低越稳(音色更一致、杂音更少),越高越有情绪起伏。0.75 是实测的折中。
+TTS_TEMPERATURE = float(os.environ.get("TTS_TEMPERATURE", "0.75"))
+TTS_TOP_K = int(os.environ.get("TTS_TOP_K", "40"))
+TTS_TOP_P = float(os.environ.get("TTS_TOP_P", "0.95"))
+
 TTS_DTYPE = os.environ.get("TTS_DTYPE", "float16")  # T4 无原生 bf16;若输出异常会自动回退 bfloat16
 LLM_DTYPE = os.environ.get("LLM_DTYPE", "float16")
 
