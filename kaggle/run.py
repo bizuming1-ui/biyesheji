@@ -15,7 +15,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 PORT = int(os.environ.get("PORT", "7860"))
-MARK = Path("/tmp/.clone_deps_ok_v3")
+MARK = Path("/tmp/.clone_deps_ok_v4")
 
 
 def log(*a):
@@ -65,23 +65,61 @@ def _torch_constraints():
     return f
 
 
+SMOKE = r"""
+import importlib.metadata as m, sys
+import transformers
+print("transformers", transformers.__version__, "| qwen-tts-hf", m.version("qwen-tts-hf") if True else "")
+from qwen_tts.core.tokenizer_12hz import modeling_qwen3_tts_tokenizer_v2 as mod
+from qwen_tts.core.tokenizer_12hz import configuration_qwen3_tts_tokenizer_v2 as cfgm
+cfg = cfgm.Qwen3TTSTokenizerV2Config()
+mod.Qwen3TTSTokenizerV2Encoder._from_config(cfg.encoder_config)   # 日志里 upsample/rope_theta 报错就出在这一步
+import faster_qwen3_tts
+print("SMOKE_OK")
+"""
+
+
+def smoke_test():
+    """真实构造一次 Qwen3-TTS 的编码器(CPU,几秒):版本不兼容(upsample / rope_theta)会在这里暴露,而不是等到加载 GPU 模型才失败。"""
+    p = subprocess.run([sys.executable, "-c", SMOKE], capture_output=True, text=True)
+    ok = "SMOKE_OK" in p.stdout
+    tail = (p.stderr.strip().splitlines() or p.stdout.strip().splitlines() or ["?"])[-1]
+    return ok, tail
+
+
 def install_deps():
     base = "fastapi 'uvicorn[standard]' python-multipart soundfile scipy noisereduce accelerate huggingface_hub"
+    c = _torch_constraints()
     if MARK.exists():
         log("依赖已安装,跳过")
     else:
-        c = _torch_constraints()
-        # 首选 faster-qwen3-tts: CUDA Graph + 流式输出 (T4 上 RTF 约 2x 提升,首块音频约 1 秒)
-        r = sh("pip install -q -c %s faster-qwen3-tts %s" % (c, base), check=False)
+        # ★ 根因修复:官方 qwen-tts 与 transformers 5.x 不兼容(报错 property 'upsample' ... has no setter),
+        #   而 transformers>5.15.1 又会报 MimiEncoderConfig 没有 rope_theta。
+        #   正确组合 = faster-qwen3-tts + qwen-tts-hf + transformers==5.15.1,且不能同时装 qwen-tts。
+        sh("pip uninstall -y -q qwen-tts", check=False)
+        r = sh("pip install -q -c %s faster-qwen3-tts 'qwen-tts-hf>=0.1.1.post1' 'transformers==5.15.1' %s" % (c, base), check=False)
         if r.returncode != 0:
-            log("⚠ faster-qwen3-tts 安装失败,回退官方 qwen-tts(整句合成,首声会慢)")
-            sh("pip install -q -c %s qwen-tts %s" % (c, base))
+            log("⚠ 依赖安装返回非 0,继续做兼容性自检")
         MARK.write_text("ok")
+    ok, msg = smoke_test()
+    log(("✓ 兼容性自检通过: " if ok else "✗ 兼容性自检失败: ") + msg)
+    if not ok:
+        log("尝试强制对齐版本 …")
+        sh("pip uninstall -y -q qwen-tts", check=False)
+        sh("pip install -q -c %s --force-reinstall --no-deps 'qwen-tts-hf>=0.1.1.post1' 'transformers==5.15.1'" % c, check=False)
+        sh("pip install -q -c %s 'huggingface_hub>=1.5,<2' faster-qwen3-tts" % c, check=False)
+        ok, msg = smoke_test()
+        log(("✓ 第二次自检通过: " if ok else "✗ 第二次自检仍失败: ") + msg)
+    if not ok:
+        log("⚠ 回退方案:官方 qwen-tts + transformers 4.57.3(整句合成,首声会慢,但能用)")
+        sh("pip uninstall -y -q faster-qwen3-tts qwen-tts-hf", check=False)
+        sh("pip install -q -c %s qwen-tts 'transformers==4.57.3' 'accelerate==1.12.0' %s" % (c, base), check=False)
     chk = subprocess.run([sys.executable, "-c", "import faster_qwen3_tts"], capture_output=True, text=True)
     if chk.returncode == 0:
         log("✓ faster-qwen3-tts 可用(CUDA Graph 流式)")
     else:
         log("faster-qwen3-tts 不可用,将使用官方 qwen-tts:", (chk.stderr.strip().splitlines() or ["?"])[-1])
+    if not shutil.which("sox"):  # 只是消除 'SoX could not be found' 警告,失败不影响使用
+        sh("(apt-get install -y -qq sox libsox-fmt-all > /dev/null 2>&1) || true", check=False)
     if not shutil.which("ffmpeg"):
         log("未找到 ffmpeg,尝试安装(浏览器录音 webm 需要它)")
         sh("apt-get install -y -qq ffmpeg > /dev/null 2>&1", check=False)
@@ -128,10 +166,28 @@ def pump(proc, prefix):
         print(prefix + line.rstrip(), flush=True)
 
 
+def kill_stale():
+    """重复运行单元格时,上一次遗留的服务/隧道进程还占着端口和显存,必须先清掉。"""
+    sh("pkill -f 'uvicorn server.app' || true", check=False)
+    sh("pkill -f cloudflared || true", check=False)
+    sh("(fuser -k %d/tcp > /dev/null 2>&1) || true" % PORT, check=False)
+    time.sleep(3)
+    try:
+        used = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"], capture_output=True, text=True
+        ).stdout.strip().splitlines()
+        for l in used:
+            idx, mb = [x.strip() for x in l.split(",")]
+            if int(mb) > 1500:
+                log("⚠ GPU%s 已被占用 %s MiB(可能是上一次运行残留)。如果后面出现显存不足,请 Kaggle 菜单 Run → Restart session 后重跑。" % (idx, mb))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def start_server():
     env = dict(os.environ, PYTHONUNBUFFERED="1", PORT=str(PORT))
     p = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "server.app:app", "--host", "0.0.0.0", "--port", str(PORT), "--ws-ping-interval", "20"],
+        [sys.executable, "-m", "uvicorn", "server.app:app", "--host", "0.0.0.0", "--port", str(PORT), "--ws-ping-interval", "30", "--ws-ping-timeout", "120"],
         cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
     threading.Thread(target=pump, args=(p, "[server] "), daemon=True).start()
@@ -201,8 +257,9 @@ def main():
     log("工作目录:", ROOT)
     load_secrets()
     check_gpus()
-    install_deps()
     if os.environ.get("CLONE_MOCK") != "1":
+        kill_stale()
+        install_deps()
         predownload()
     server = start_server()
     url = None
