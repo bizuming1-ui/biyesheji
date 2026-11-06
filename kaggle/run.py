@@ -290,6 +290,7 @@ def banner(url):
     print("\n" + line)
     print("  ✅ 克隆语音系统已就绪,请打开下面的网址(粘贴到「浏览器模拟器」地址栏即可):")
     print("\n      " + url + "\n")
+    print("  🔎 检测日志(完整参数):" + url + "/api/diag   (浏览器模拟器右上角「检测日志」会自动读取)")
     print(line + "\n", flush=True)
     try:
         from IPython.display import HTML, display
