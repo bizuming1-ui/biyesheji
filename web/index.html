@@ -256,11 +256,13 @@ class GaplessPlayer {
 }
 const player = new GaplessPlayer();
 
+let jobTimer = null;
 /* ---------------- 状态轮询 ---------------- */
 let STATUS = null;
 async function pollStatus() {
   try {
-    const s = await (await fetch("/api/status")).json(); STATUS = s;
+    const s = await (await jfetch("/api/status", {}, 8000)).json(); STATUS = s;
+    if (s.job && s.job.state === "running" && !jobTimer) { $("train").disabled = true; startJobPoll(); }
     const w = s.workers, st = (n) => (w[n] ? w[n].state : "none");
     const ttsStates = Object.keys(w).filter((k) => k.startsWith("tts")).map(st);
     const ready = ttsStates.filter((x) => x === "ready").length;
@@ -284,7 +286,7 @@ async function pollStatus() {
     } else eb.classList.remove("show");
   } catch (e) { /* 服务重启中 */ }
 }
-setInterval(pollStatus, 2000); pollStatus();
+setInterval(pollStatus, 3000); pollStatus();
 
 $("reload").onclick = async () => {
   try { const r = await (await fetch("/api/reload", { method: "POST" })).json(); toast("正在重新加载: " + (r.reloading || []).join(", "), 4000); pollStatus(); }
@@ -335,25 +337,27 @@ $("file").onchange = (e) => { const f = e.target.files[0]; if (f) { setRef(f); t
 $("clear").onclick = () => { refBlob = null; $("preview").style.display = "none"; $("train").disabled = true; $("rectime").textContent = "00:00"; };
 
 /* ---------------- 训练 ---------------- */
-let jobTimer = null;
 $("train").onclick = async () => {
   if (!refBlob) return;
-  const fd = new FormData(); fd.append("file", refBlob, "ref.webm"); fd.append("text", $("reftext").value);
+  const fd = new FormData(); fd.append("file", refBlob, "ref.webm"); fd.append("text", $("reftext").value); fd.append("lang", scriptIdx % SCRIPTS.length === 2 ? "en" : "zh");
   $("train").disabled = true; $("result").style.display = "none"; $("warns").textContent = "";
-  const r = await fetch("/api/voice/train", { method: "POST", body: fd });
+  let r = null;
+  for (let i = 0; i < 4 && !r; i++) { try { r = await jfetch("/api/voice/train", { method: "POST", body: fd }, 60000); } catch (e) { await sleep(800 * (i + 1)); } }
+  if (!r) { toast("无法连接服务器,请稍后再点开始训练", 5000); $("train").disabled = false; return; }
   if (!r.ok) { const j = await r.json().catch(() => ({})); toast("启动训练失败: " + (j.detail || r.status), 5000); $("train").disabled = false; return; }
-  clearInterval(jobTimer); jobTimer = setInterval(pollJob, 600); pollJob();
+  startJobPoll();
 };
+function startJobPoll() { clearInterval(jobTimer); jobTimer = setInterval(pollJob, 800); pollJob(); }
 async function pollJob() {
   try {
-    const j = await (await fetch("/api/voice/job")).json();
+    const j = await (await jfetch("/api/voice/job", {}, 8000)).json();
     if (j.state === "idle") return;
     $("pall").style.width = (j.progress || 0) + "%";
     $("gl").innerHTML = (j.gpus || []).map((g) => `<b style="color:#cfd6ff">GPU${g.gpu}</b><div class="prog"><i style="width:${g.progress}%"></i></div><span class="m">${g.msg}</span>`).join("")
       + `<span class="m" style="color:#cfd6ff">${j.stage || ""}</span>`;
     $("warns").textContent = (j.warnings || []).join(" · ");
     if (j.state === "done" || j.state === "error") {
-      clearInterval(jobTimer); $("train").disabled = !refBlob;
+      clearInterval(jobTimer); jobTimer = null; $("train").disabled = !refBlob;
       if (j.state === "done") {
         const sim = j.similarity; $("result").style.display = "flex";
         $("ring").style.setProperty("--p", sim != null ? Math.min(100, sim * 100) : 0);
@@ -368,56 +372,48 @@ async function pollJob() {
   } catch (e) {}
 }
 
-/* ---------------- WebSocket / 对话 ---------------- */
-let pendingChat = null, lastPong = performance.now();
-let lastMsgAt = 0, gotStart = false, ws = null, wsReady = false, tSend = 0, curBubble = null, autoPlay = true, longMode = false, fillerOn = true;
-function setConn(ok) { const d = $("d-conn"); if (d) { d.className = "dot " + (ok ? "ok" : "err"); $("t-conn").textContent = ok ? "已连接" : "重连中"; } }
-function connectWS() {
-  ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws"); ws.binaryType = "arraybuffer";
-  ws.onopen = () => { wsReady = true; lastPong = performance.now(); setConn(true); if (pendingChat) { const t = pendingChat; pendingChat = null; doSend(t); } };
-  ws.onclose = () => { wsReady = false; setConn(false); if (curBubble) { addMsg("e", "⚠ 与服务器的连接中断,正在自动重连…(如果持续失败,请确认 Kaggle 单元格仍在运行)"); endBubble(); } setTimeout(connectWS, 600); };
-  ws.onmessage = (ev) => {
-    if (typeof ev.data === "string" && ev.data.indexOf('"pong"') > 0) { lastPong = performance.now(); return; }
-    lastMsgAt = performance.now();
-    if (typeof ev.data !== "string") {
-      const dv = new DataView(ev.data), turn = dv.getUint32(0, true), idx = dv.getUint32(4, true), sr = dv.getUint32(8, true);
-      if (!autoPlay) return;
-      const i16 = new Int16Array(ev.data, 16, (ev.data.byteLength - 16) >> 1), f = new Float32Array(i16.length);
-      for (let i = 0; i < i16.length; i++) f[i] = i16[i] / 32768;
-      player.push(turn, idx, sr, f); return;
-    }
-    const m = JSON.parse(ev.data);
-    if (m.type === "start") { gotStart = true; player.ensure(); player.newTurn(m.turn); player.fillerFirst = !!m.filler; }
-    else if (m.type === "text") { if (curBubble) { curBubble.textContent += m.delta; scrollDown(); } }
-    else if (m.type === "notice") addMsg("s", m.text);
-    else if (m.type === "warn") toast(m.text, 4000);
-    else if (m.type === "error") { endBubble(); addMsg("e", "⚠ " + m.text); }
-    else if (m.type === "done") {
-      endBubble(); player.finish(m.stats.chunks);
-      const g = m.stats.gpu_chunks || {}; const gs = Object.keys(g).sort().map((k) => k.toUpperCase() + "×" + g[k]).join(" ");
-      $("ttfa").title = "服务端首声 " + m.stats.ttfa_ms + "ms · LLM首字 " + m.stats.llm_first_ms + "ms · " + gs;
-      if (m.stats.chunks) addMsg("s", `音频 ${m.stats.audio_s}s · 首声 ${((m.stats.ttfa_ms || 0) / 1000).toFixed(2)}s · 正文首声 ${((m.stats.body_ttfa_ms || 0) / 1000).toFixed(2)}s · ${gs}${player.underruns ? " · 自适应缓冲已调整" : ""}`);
-    } else if (m.type === "stopped") { player.stop(); endBubble(); }
-  };
+/* ---------------- HTTP 长轮询对话 ----------------
+   为什么不用 WebSocket:隧道/代理会悄悄丢掉它,表现就是「发了没反应」「连接不稳定」。
+   现在:POST /api/chat 创建一轮对话(服务端独立生成,与连接无关)→ GET /api/events?after=N 长轮询取增量。
+   任何一次请求失败都用同一个游标自动重试,文本和音频一个都不会丢。 */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const SID = (() => {
+  let s = null; try { s = localStorage.getItem("vc_sid"); } catch (e) {}
+  if (!s) { s = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : (Math.random().toString(36).slice(2) + Date.now().toString(36)); try { localStorage.setItem("vc_sid", s); } catch (e) {} }
+  return s;
+})();
+let tSend = 0, curBubble = null, autoPlay = true, longMode = false, fillerOn = true, runId = 0, connFail = 0;
+function setConn(ok) {
+  connFail = ok ? 0 : connFail + 1;
+  const d = $("d-conn"); if (!d) return;
+  const good = ok || connFail < 2;
+  d.className = "dot " + (good ? "ok" : "err"); $("t-conn").textContent = good ? "已连接" : "重连中";
 }
-connectWS();
-/* 心跳:每 8 秒一次;30 秒收不到 pong 就主动断开重连(隧道偶尔会悄悄丢掉 WebSocket,以前就是这样「发了没反应」) */
-setInterval(() => {
-  if (!wsReady) return;
-  try { ws.send('{"type":"ping"}'); } catch (e) {}
-  if (performance.now() - lastPong > 30000) { try { ws.close(); } catch (e) {} }
-}, 8000);
-document.addEventListener("visibilitychange", () => { if (!document.hidden && wsReady) { try { ws.send('{"type":"ping"}'); } catch (e) {} } });
-/* 看门狗:发送后如果服务端长时间没有任何输出,必须明确告诉用户,而不是一直转圈 */
-setInterval(() => {
-  if (!curBubble) return;
-  const idle = (performance.now() - lastMsgAt) / 1000;
-  if ((!gotStart && idle > 12) || idle > 50) {
-    addMsg("e", gotStart ? "⚠ 服务端 50 秒没有任何输出。请点「停止」后重试;并查看 Kaggle 输出框里的 [turn]/[llm] 日志。" : "⚠ 服务端 12 秒没有响应。可能服务正在重启或网络断开,请稍后重试。");
-    endBubble();
+async function jfetch(url, opt, timeoutMs) {
+  const ac = new AbortController(), t = setTimeout(() => ac.abort(), timeoutMs || 20000);
+  try { return await fetch(url, Object.assign({ cache: "no-store", signal: ac.signal }, opt || {})); } finally { clearTimeout(t); }
+}
+async function postRetry(url, body, tries) {
+  let d = 400;
+  for (let i = 0; i < (tries || 8); i++) {
+    try {
+      const r = await jfetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }, 15000);
+      if (r.ok) { setConn(true); return await r.json(); }
+      if (r.status >= 400 && r.status < 500) { const e = new Error(((await r.text()) || r.status).toString().slice(0, 160)); e.fatal = true; throw e; }
+    } catch (e) { if (e.fatal) throw e; setConn(false); }
+    await sleep(d); d = Math.min(3000, d * 1.6);
   }
-}, 2000);
-function send(o) { if (wsReady) ws.send(JSON.stringify(o)); }
+  throw new Error("无法连接服务器(已自动重试多次),请确认 Kaggle 单元格仍在运行");
+}
+/* 心跳:5 秒一次,仅用于显示连接状态 */
+setInterval(async () => { try { const r = await jfetch("/api/ping", {}, 6000); setConn(r.ok); } catch (e) { setConn(false); } }, 5000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) pollStatus(); });
+
+function b64ToF32(b64) {
+  const bin = atob(b64), n = bin.length >> 1, f = new Float32Array(n);
+  for (let i = 0; i < n; i++) { let v = bin.charCodeAt(2 * i) | (bin.charCodeAt(2 * i + 1) << 8); if (v & 0x8000) v -= 0x10000; f[i] = v / 32768; }
+  return f;
+}
 player.onstate = (s) => { $("pstate").textContent = { idle: "待机", playing: "● 正在朗读", buffering: "缓冲中…" }[s] || s; $("pstate").style.color = s === "playing" ? "var(--ok)" : "var(--mut)"; };
 player.onfirst = (now, lead) => { const ms = now - tSend + lead * 1000; $("ttfa").textContent = (ms / 1000).toFixed(2) + "s"; $("ttfa").style.color = ms < 3000 ? "var(--ok)" : "var(--warn)"; };
 function scrollDown() { const m = $("msgs"); m.scrollTop = m.scrollHeight; }
@@ -425,27 +421,68 @@ function addMsg(cls, text) {
   const m = $("msgs"); const e = m.querySelector(".empty"); if (e) e.remove();
   const d = document.createElement("div"); d.className = "msg " + cls; d.textContent = text; m.appendChild(d); scrollDown(); return d;
 }
-function endBubble() { if (curBubble) { curBubble.classList.remove("live"); curBubble = null; } }
-function doSend(text) {
-  curBubble = addMsg("a live", ""); tSend = performance.now(); lastMsgAt = tSend; gotStart = false;
-  send({ type: "chat", text, opts: { long: longMode, breath: $("breath").value / 100, filler: fillerOn } });
+function endBubble() { if (curBubble) { if (!curBubble.textContent) curBubble.remove(); else curBubble.classList.remove("live"); curBubble = null; } }
+
+function handleEvent(m, bubble) {
+  if (m.type === "audio") {
+    if (autoPlay) player.push(m.turn, m.idx, m.sr, b64ToF32(m.b64));
+  } else if (m.type === "start") { player.ensure(); player.newTurn(m.turn); player.fillerFirst = !!m.filler; }
+  else if (m.type === "text") { bubble.textContent += m.delta; scrollDown(); }
+  else if (m.type === "notice") addMsg("s", m.text);
+  else if (m.type === "warn") toast(m.text, 4000);
+  else if (m.type === "error") { player.finish(player.expect + player.pending.size); addMsg("e", "⚠ " + m.text); }
+  else if (m.type === "done") {
+    player.finish(m.stats.chunks);
+    const g = m.stats.gpu_chunks || {}; const gs = Object.keys(g).sort().map((k) => k.toUpperCase() + "×" + g[k]).join(" ");
+    $("ttfa").title = "服务端首声 " + m.stats.ttfa_ms + "ms · LLM首字 " + m.stats.llm_first_ms + "ms · " + gs;
+    if (m.stats.chunks) addMsg("s", `音频 ${m.stats.audio_s}s · 首声 ${((m.stats.ttfa_ms || 0) / 1000).toFixed(2)}s · 正文首声 ${((m.stats.body_ttfa_ms || 0) / 1000).toFixed(2)}s · ${gs}${player.underruns ? " · 自适应缓冲已调整" : ""}`);
+  } else if (m.type === "stopped") { player.stop(); }
+}
+
+async function doChat(text, speak) {
+  const my = ++runId;
+  const bubble = curBubble = addMsg("a live", ""); tSend = performance.now();
+  let tid;
+  try { tid = (await postRetry("/api/chat", { sid: SID, text, speak: !!speak, opts: { long: longMode, breath: $("breath").value / 100, filler: fillerOn } })).tid; }
+  catch (e) { if (my === runId) { endBubble(); addMsg("e", "⚠ 发送失败:" + e.message); } return; }
+  let after = 0, fails = 0, lastAct = performance.now();
+  while (my === runId) {
+    let j;
+    try {
+      const r = await jfetch(`/api/events?sid=${encodeURIComponent(SID)}&tid=${tid}&after=${after}&wait=12`, {}, 26000);
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      j = await r.json(); fails = 0; setConn(true);
+    } catch (e) {
+      fails++; setConn(false);
+      if (fails > 60) { if (my === runId) { endBubble(); addMsg("e", "⚠ 与服务器断开超过 1 分钟,请检查 Kaggle 单元格是否仍在运行,然后重新发送。"); } return; }
+      await sleep(Math.min(2000, 250 * fails)); continue;
+    }
+    if (my !== runId) return;
+    if (j.superseded) break;
+    for (const m of j.events) { try { handleEvent(m, bubble); } catch (e) { console.error(e); } }
+    after = j.next;
+    if (j.events.length) lastAct = performance.now();
+    if (j.done) break;
+    if (performance.now() - lastAct > 150000) { addMsg("e", "⚠ 服务端 150 秒没有任何输出。请点「停止」后重试,并查看 Kaggle 输出框里的 [turn]/[llm] 日志。"); break; }
+  }
+  if (my === runId) endBubble();
+}
+function send(o) {   // 兼容旧调用
+  if (o.type === "stop") postRetry("/api/stop", { sid: SID }, 3).catch(() => {});
+  else if (o.type === "reset") postRetry("/api/reset", { sid: SID }, 3).catch(() => {});
 }
 function sendChat(text) {
   text = (text || "").trim(); if (!text) return false;
   player.ensure(); player.stop(); endBubble();
-  addMsg("u", text);   // 无论连接是否正常,消息先显示出来,绝不「点了没反应」
-  if (!wsReady) {
-    pendingChat = text; addMsg("s", "⏳ 正在重新连接服务器,连上后会自动发送这条消息…");
-    return true;
-  }
-  doSend(text);
+  addMsg("u", text);   // 无论网络如何,消息先显示出来,绝不「点了没反应」
+  doChat(text, false);
   return true;
 }
 $("send").onclick = () => { const v = $("input").value; if (sendChat(v)) $("input").value = ""; };
 $("input").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.isComposing) $("send").click(); });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") $("stop").click(); });
-$("stop").onclick = () => { send({ type: "stop" }); player.stop(); endBubble(); };
-$("reset").onclick = () => { send({ type: "reset" }); player.stop(); $("msgs").innerHTML = ""; addMsg("s", "已开始新对话"); };
+$("stop").onclick = () => { runId++; send({ type: "stop" }); player.stop(); endBubble(); };
+$("reset").onclick = () => { runId++; send({ type: "reset" }); player.stop(); endBubble(); $("msgs").innerHTML = ""; addMsg("s", "已开始新对话"); };
 const tgl = (id, cb) => { const e = $(id); e.onclick = (ev) => { if (ev.target.tagName === "INPUT") return; e.classList.toggle("on"); cb(e.classList.contains("on")); }; };
 tgl("tgAuto", (v) => { autoPlay = v; if (!v) player.stop(); }); tgl("tgLong", (v) => (longMode = v)); tgl("tgSmooth", (v) => (player.floor = v ? 1.2 : 0)); tgl("tgFiller", (v) => (fillerOn = v));
 
