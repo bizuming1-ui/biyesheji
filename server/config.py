@@ -12,17 +12,24 @@ VOICE_DIR.mkdir(parents=True, exist_ok=True)
 MOCK = os.environ.get("CLONE_MOCK", "0") == "1"
 PORT = int(os.environ.get("PORT", "7860"))
 
-# ---- 模型 ----
+# ---- 模型(全部常驻显存:服务进程不退出,模型就不会卸载) ----
 TTS_MODEL = os.environ.get("TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
 LLM_MODEL = os.environ.get("LLM_MODEL", "Qwen/Qwen3-4B-Instruct-2507")
 ASR_MODEL = os.environ.get("ASR_MODEL", "openai/whisper-large-v3-turbo")
 SV_MODEL = os.environ.get("SV_MODEL", "microsoft/wavlm-base-plus-sv")
-DET_MODEL = os.environ.get("DET_MODEL", "google/owlvit-base-patch32")
 
 SR = 24000  # Qwen3-TTS 输出采样率
 LLM_DEFAULT_TOKENS = int(os.environ.get("LLM_DEFAULT_TOKENS", "1024"))
 LLM_LONG_TOKENS = int(os.environ.get("LLM_LONG_TOKENS", "4096"))
 HISTORY_CHARS = int(os.environ.get("HISTORY_CHARS", "7000"))
+LLM_FIRST_TOKEN_TIMEOUT = float(os.environ.get("LLM_FIRST_TOKEN_TIMEOUT", "60"))  # 秒,超时必给出错误,绝不静默卡死
+LLM_STALL_TIMEOUT = float(os.environ.get("LLM_STALL_TIMEOUT", "45"))
+
+# ---- 流式 TTS ----
+# faster-qwen3-tts: CUDA Graph + 流式输出。chunk=4 步 ≈ 0.33s 音频,首块越小首声越快。
+TTS_STREAM = os.environ.get("TTS_STREAM", "1") == "1"
+TTS_CHUNK_FIRST = int(os.environ.get("TTS_CHUNK_FIRST", "4"))
+TTS_CHUNK_NEXT = int(os.environ.get("TTS_CHUNK_NEXT", "8"))
 
 # ---- 分句策略 (决定首声延迟) ----
 FIRST_MIN_CHARS = int(os.environ.get("FIRST_MIN_CHARS", "3"))
@@ -40,6 +47,7 @@ SYSTEM_PROMPT = (
 )
 
 TTS_DTYPE = os.environ.get("TTS_DTYPE", "float16")  # T4 无原生 bf16;若输出异常会自动回退 bfloat16
+LLM_DTYPE = os.environ.get("LLM_DTYPE", "float16")
 
 # 预合成并缓存的「思考语气词」(用克隆声音生成,每轮对话 0 延迟先播,正文在后台同步合成)
 FILLERS = {
@@ -47,33 +55,3 @@ FILLERS = {
     "English": ["Hmm,", "Well,", "Okay,", "Sure,", "Let me think,"],
 }
 FILLER_HINT = "(系统已经替你先说了一个简短的语气词「%s」,你的正文请直接接着回答,不要再用语气词开头。)"
-
-# 开放词汇检测的默认词表 (英文, 中文)
-DETECT_LABELS = [
-    ("person", "人"), ("face", "脸"), ("hand", "手"), ("cat", "猫"), ("dog", "狗"),
-    ("bird", "鸟"), ("horse", "马"), ("cow", "牛"), ("sheep", "羊"), ("fish", "鱼"),
-    ("car", "汽车"), ("bus", "公交车"), ("truck", "卡车"), ("bicycle", "自行车"),
-    ("motorcycle", "摩托车"), ("airplane", "飞机"), ("boat", "船"), ("train", "火车"),
-    ("traffic light", "红绿灯"), ("chair", "椅子"), ("sofa", "沙发"), ("bed", "床"),
-    ("table", "桌子"), ("desk", "书桌"), ("door", "门"), ("window", "窗户"),
-    ("laptop", "笔记本电脑"), ("computer monitor", "显示器"), ("keyboard", "键盘"),
-    ("computer mouse", "鼠标"), ("cell phone", "手机"), ("tablet", "平板"),
-    ("television", "电视"), ("remote control", "遥控器"), ("headphones", "耳机"),
-    ("camera", "相机"), ("clock", "时钟"), ("lamp", "台灯"), ("book", "书"),
-    ("notebook", "笔记本"), ("pen", "笔"), ("pencil", "铅笔"), ("scissors", "剪刀"),
-    ("backpack", "背包"), ("handbag", "手提包"), ("umbrella", "雨伞"), ("wallet", "钱包"),
-    ("glasses", "眼镜"), ("watch", "手表"), ("hat", "帽子"), ("shoe", "鞋"),
-    ("bottle", "瓶子"), ("cup", "杯子"), ("mug", "马克杯"), ("bowl", "碗"),
-    ("plate", "盘子"), ("fork", "叉子"), ("knife", "刀"), ("spoon", "勺子"),
-    ("apple", "苹果"), ("banana", "香蕉"), ("orange", "橙子"), ("pizza", "披萨"),
-    ("sandwich", "三明治"), ("cake", "蛋糕"), ("potted plant", "盆栽"), ("flower", "花"),
-    ("tree", "树"), ("vase", "花瓶"), ("pillow", "枕头"), ("blanket", "毯子"),
-    ("toy", "玩具"), ("teddy bear", "泰迪熊"), ("ball", "球"), ("guitar", "吉他"),
-    ("microphone", "麦克风"), ("speaker", "音箱"), ("refrigerator", "冰箱"),
-    ("microwave", "微波炉"), ("oven", "烤箱"), ("sink", "水槽"), ("toilet", "马桶"),
-    ("mirror", "镜子"), ("painting", "画"), ("bag", "袋子"), ("box", "盒子"),
-    ("key", "钥匙"), ("coin", "硬币"), ("charger", "充电器"), ("cable", "数据线"),
-    ("water bottle", "水壶"), ("tissue box", "纸巾盒"), ("trash can", "垃圾桶"),
-]
-ZH2EN = {zh: en for en, zh in DETECT_LABELS}
-EN2ZH = {en: zh for en, zh in DETECT_LABELS}
