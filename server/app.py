@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 from . import config
 from .engine import Engine, pack_audio
@@ -50,7 +50,19 @@ async def health():
 
 @app.get("/api/status")
 async def status():
-    return engine.status()
+    return await asyncio.to_thread(engine.status)
+
+
+@app.post("/api/reload")
+async def reload_models():
+    """某个模型加载失败时,界面上的「重新加载模型」按钮调用它(不用重启整个 Kaggle 单元格)。"""
+    names = engine.reload_failed()
+    return {"ok": True, "reloading": names}
+
+
+@app.get("/favicon.ico")
+async def favicon():
+    return Response(status_code=204)
 
 
 @app.post("/api/voice/train")
