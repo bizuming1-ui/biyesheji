@@ -35,7 +35,7 @@
   .gbar{width:46px;height:6px;border-radius:4px;background:rgba(255,255,255,.1);overflow:hidden}
   .gbar>i{display:block;height:100%;background:linear-gradient(90deg,var(--a1),var(--a2));width:0;transition:width .5s}
   /* layout */
-  main{min-height:0;display:grid;grid-template-columns:340px minmax(0,1fr) 330px;gap:10px}
+  main{min-height:0;display:grid;grid-template-columns:380px minmax(0,1fr);gap:10px}
   .card{min-height:0;display:flex;flex-direction:column;border-radius:18px;background:var(--panel);border:1px solid var(--line);
     backdrop-filter:blur(14px);padding:14px;gap:10px;overflow:hidden}
   .card h2{font-size:13px;font-weight:600;letter-spacing:.4px;display:flex;align-items:center;gap:8px;color:#cfd6ff}
@@ -80,6 +80,7 @@
   @keyframes in{from{opacity:0;transform:translateY(6px)}}
   .msg.u{align-self:flex-end;background:linear-gradient(135deg,rgba(124,92,255,.85),rgba(91,140,255,.8));border-bottom-right-radius:5px}
   .msg.a{align-self:flex-start;background:rgba(255,255,255,.07);border:1px solid var(--line);border-bottom-left-radius:5px}
+  .msg.e{align-self:center;font-size:12.5px;color:#ffd1d8;background:rgba(251,113,133,.14);border:1px solid rgba(251,113,133,.4);max-width:92%}
   .msg.s{align-self:center;font-size:12px;color:var(--mut);background:none;padding:2px}
   .msg.a.live::after{content:"▍";color:var(--a2);animation:blink 1s infinite}
   .empty{margin:auto;text-align:center;color:var(--mut);line-height:2}
@@ -114,10 +115,10 @@
   /* narrow screens: tabs, still no scrolling */
   @media (max-width:1080px){
     main{grid-template-columns:1fr;grid-template-rows:1fr 48px}
-    .tabs{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;order:2}
+    .tabs{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;order:2}
     .tabs button{border-radius:14px;background:var(--panel);border:1px solid var(--line)}
     .tabs button.on{background:linear-gradient(135deg,var(--a1),var(--a2));border:0}
-    main>.card{display:none;order:1} main[data-tab="clone"]>#c-clone,main[data-tab="chat"]>#c-chat,main[data-tab="vision"]>#c-vision{display:flex}
+    main>.card{display:none;order:1} main[data-tab="clone"]>#c-clone,main[data-tab="chat"]>#c-chat,
     .hide-n{display:none}
   }
 </style>
@@ -125,7 +126,7 @@
 <body>
 <div id="gate"><div class="box">
   <div class="orb"></div><h1>Voice Clone Studio</h1>
-  <p>双卡 Qwen3-TTS 声音克隆 · 实时对话 · 物体检测<br/>点击下方按钮启用声音(浏览器要求一次用户手势才能自动播放)。</p>
+  <p>双卡 Qwen3-TTS 声音克隆 · 实时对话<br/>点击下方按钮启用声音(浏览器要求一次用户手势才能自动播放)。</p>
   <button class="btn pri" id="enter" style="padding:13px 34px;font-size:16px">进入系统</button>
 </div></div>
 
@@ -133,6 +134,7 @@
   <header>
     <div class="logo"><i>🎙</i>Voice Clone Studio</div>
     <div class="sp"></div>
+    <div class="chip hide-n"><span class="dot" id="d-conn"></span>连接 <b id="t-conn">…</b></div>
     <div class="chip hide-n"><span class="dot" id="d-llm"></span>对话 <b id="t-llm">…</b></div>
     <div class="chip hide-n"><span class="dot" id="d-tts"></span>语音 <b id="t-tts">…</b></div>
     <div class="chip" id="g0"><b>GPU0</b><div class="gbar"><i></i></div><span>—</span></div>
@@ -168,7 +170,6 @@
         <label class="tg on" id="tgSmooth" title="播放中途若合成跟不上,先攒够缓冲再继续,避免卡顿">🧵 无停顿优先</label>
         <label class="tg on" id="tgFiller" title="用你的克隆声音先说「嗯,」「好的,」,0 延迟出声,正文同时在双卡合成">💬 语气词先行</label>
         <label class="tg" id="tgLong">📖 长文模式</label>
-        <label class="tg" id="tgVision">👁 让 AI 看到画面</label>
         <label class="tg hide-n">🌬 呼吸 <input type="range" id="breath" min="0" max="100" value="40" /></label>
         <button class="tg" id="reset">🧹 新对话</button>
       </div>
@@ -180,17 +181,7 @@
       </div>
     </section>
 
-    <!-- ③ 检测 -->
-    <section class="card" id="c-vision">
-      <h2><span class="num">3</span>万物检测<em id="detinfo">未开启</em></h2>
-      <div class="vid"><video id="video" playsinline muted></video><canvas id="overlay"></canvas>
-        <div class="ph" id="vph">点击下方按钮开启摄像头<br/>支持任意物体(开放词汇)</div></div>
-      <div class="row"><button class="btn pri" id="cam">📷 开启摄像头</button><button class="btn" id="askSee">问 AI:眼前有什么?</button></div>
-      <input class="t" id="labels" placeholder="自定义检测词,逗号分隔(留空=内置 90+ 种)。如:杯子,keyboard" />
-      <div id="chips"></div>
-    </section>
-
-    <nav class="tabs"><button data-t="clone">🎤 克隆</button><button data-t="chat" class="on">💬 对话</button><button data-t="vision">👁 检测</button></nav>
+    <nav class="tabs"><button data-t="clone">🎤 克隆</button><button data-t="chat" class="on">💬 对话</button></nav>
   </main>
 </div>
 <div id="toast"></div>
@@ -239,7 +230,7 @@ class GaplessPlayer {
     const idle = this.srcs.size === 0 || lead < 0.01;
     if (idle && this.pending.has(this.expect)) {
       const isRe = this.expect > 0;                       // 播放中途断流 → 重新缓冲
-      const need = isRe ? Math.max(this.hold, this.floor) : 0;                  // 首句立即播,中途缺料则多攒一点
+      const need = isRe ? Math.max(this.hold, this.floor) : (this.fillerFirst || !this.floor ? 0 : 0.6);                  // 首句立即播,中途缺料则多攒一点
       const all = this.total !== null && this.expect + this.pending.size >= this.total;
       if (!this.waitSince) this.waitSince = performance.now();
       const waited = (performance.now() - this.waitSince) / 1000;
@@ -368,12 +359,14 @@ async function pollJob() {
 }
 
 /* ---------------- WebSocket / 对话 ---------------- */
-let ws = null, wsReady = false, tSend = 0, curBubble = null, autoPlay = true, longMode = false, seeMode = false, fillerOn = true;
+let lastMsgAt = 0, gotStart = false, ws = null, wsReady = false, tSend = 0, curBubble = null, autoPlay = true, longMode = false, fillerOn = true;
+function setConn(ok) { const d = $("d-conn"); if (d) { d.className = "dot " + (ok ? "ok" : "err"); $("t-conn").textContent = ok ? "已连接" : "重连中"; } }
 function connectWS() {
   ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws"); ws.binaryType = "arraybuffer";
-  ws.onopen = () => { wsReady = true; };
-  ws.onclose = () => { wsReady = false; setTimeout(connectWS, 1200); };
+  ws.onopen = () => { wsReady = true; setConn(true); };
+  ws.onclose = () => { wsReady = false; setConn(false); if (curBubble) { addMsg("e", "⚠ 与服务器的连接中断,正在自动重连…(如果持续失败,请确认 Kaggle 单元格仍在运行)"); endBubble(); } setTimeout(connectWS, 1200); };
   ws.onmessage = (ev) => {
+    lastMsgAt = performance.now();
     if (typeof ev.data !== "string") {
       const dv = new DataView(ev.data), turn = dv.getUint32(0, true), idx = dv.getUint32(4, true), sr = dv.getUint32(8, true);
       if (!autoPlay) return;
@@ -382,11 +375,11 @@ function connectWS() {
       player.push(turn, idx, sr, f); return;
     }
     const m = JSON.parse(ev.data);
-    if (m.type === "start") { player.ensure(); player.newTurn(m.turn); }
+    if (m.type === "start") { gotStart = true; player.ensure(); player.newTurn(m.turn); player.fillerFirst = !!m.filler; }
     else if (m.type === "text") { if (curBubble) { curBubble.textContent += m.delta; scrollDown(); } }
     else if (m.type === "notice") addMsg("s", m.text);
     else if (m.type === "warn") toast(m.text, 4000);
-    else if (m.type === "error") { endBubble(); addMsg("s", "⚠ " + m.text); }
+    else if (m.type === "error") { endBubble(); addMsg("e", "⚠ " + m.text); }
     else if (m.type === "done") {
       endBubble(); player.finish(m.stats.chunks);
       const g = m.stats.gpu_chunks || {}; const gs = Object.keys(g).sort().map((k) => k.toUpperCase() + "×" + g[k]).join(" ");
@@ -396,6 +389,15 @@ function connectWS() {
   };
 }
 connectWS(); setInterval(() => wsReady && ws.send('{"type":"ping"}'), 20000);
+/* 看门狗:发送后如果服务端长时间没有任何输出,必须明确告诉用户,而不是一直转圈 */
+setInterval(() => {
+  if (!curBubble) return;
+  const idle = (performance.now() - lastMsgAt) / 1000;
+  if ((!gotStart && idle > 12) || idle > 50) {
+    addMsg("e", gotStart ? "⚠ 服务端 50 秒没有任何输出。请点「停止」后重试;并查看 Kaggle 输出框里的 [turn]/[llm] 日志。" : "⚠ 服务端 12 秒没有响应。可能服务正在重启或网络断开,请稍后重试。");
+    endBubble();
+  }
+}, 2000);
 function send(o) { if (wsReady) ws.send(JSON.stringify(o)); }
 player.onstate = (s) => { $("pstate").textContent = { idle: "待机", playing: "● 正在朗读", buffering: "缓冲中…" }[s] || s; $("pstate").style.color = s === "playing" ? "var(--ok)" : "var(--mut)"; };
 player.onfirst = (now, lead) => { const ms = now - tSend + lead * 1000; $("ttfa").textContent = (ms / 1000).toFixed(2) + "s"; $("ttfa").style.color = ms < 3000 ? "var(--ok)" : "var(--warn)"; };
@@ -406,20 +408,20 @@ function addMsg(cls, text) {
 }
 function endBubble() { if (curBubble) { curBubble.classList.remove("live"); curBubble = null; } }
 function sendChat(text) {
-  text = (text || "").trim(); if (!text) return;
-  if (!wsReady) { toast("连接中,请稍候…"); return; }
+  text = (text || "").trim(); if (!text) return false;
+  if (!wsReady) { toast("正在连接服务器,请稍候再发送…", 3000); return false; }
   player.ensure(); player.stop(); endBubble();
-  addMsg("u", text); curBubble = addMsg("a live", ""); tSend = performance.now();
-  const vision = seeMode ? lastLabels : [];
-  send({ type: "chat", text, opts: { long: longMode, breath: $("breath").value / 100, vision, filler: fillerOn } });
+  addMsg("u", text); curBubble = addMsg("a live", ""); tSend = performance.now(); lastMsgAt = tSend; gotStart = false;
+  send({ type: "chat", text, opts: { long: longMode, breath: $("breath").value / 100, filler: fillerOn } });
+  return true;
 }
-$("send").onclick = () => { const v = $("input").value; $("input").value = ""; sendChat(v); };
+$("send").onclick = () => { const v = $("input").value; if (sendChat(v)) $("input").value = ""; };
 $("input").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.isComposing) $("send").click(); });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") $("stop").click(); });
 $("stop").onclick = () => { send({ type: "stop" }); player.stop(); endBubble(); };
 $("reset").onclick = () => { send({ type: "reset" }); player.stop(); $("msgs").innerHTML = ""; addMsg("s", "已开始新对话"); };
 const tgl = (id, cb) => { const e = $(id); e.onclick = (ev) => { if (ev.target.tagName === "INPUT") return; e.classList.toggle("on"); cb(e.classList.contains("on")); }; };
-tgl("tgAuto", (v) => { autoPlay = v; if (!v) player.stop(); }); tgl("tgLong", (v) => (longMode = v)); tgl("tgSmooth", (v) => (player.floor = v ? 1.2 : 0)); tgl("tgFiller", (v) => (fillerOn = v)); tgl("tgVision", (v) => { seeMode = v; if (v && !camOn) toast("请先在右侧开启摄像头"); });
+tgl("tgAuto", (v) => { autoPlay = v; if (!v) player.stop(); }); tgl("tgLong", (v) => (longMode = v)); tgl("tgSmooth", (v) => (player.floor = v ? 1.2 : 0)); tgl("tgFiller", (v) => (fillerOn = v));
 
 /* ---------------- 语音输入(自动断句) ---------------- */
 let micRec = null, micStream = null, micAC = null, micRAF = 0;
@@ -464,50 +466,6 @@ const viz = $("viz"), vctx = viz.getContext("2d");
   }
   requestAnimationFrame(drawViz);
 })();
-
-/* ---------------- 物体检测 ---------------- */
-let camOn = false, camStream = null, detBusy = false, lastLabels = [], lastBoxes = [], detTimer = null;
-const video = $("video"), ov = $("overlay"), octx = ov.getContext("2d"), grab = document.createElement("canvas");
-const colorOf = (s) => { let h = 0; for (const c of s) h = (h * 31 + c.charCodeAt(0)) % 360; return `hsl(${h} 90% 62%)`; };
-function drawBoxes() {
-  const r = ov.getBoundingClientRect(); ov.width = r.width * devicePixelRatio; ov.height = r.height * devicePixelRatio; octx.clearRect(0, 0, ov.width, ov.height);
-  if (!camOn || !video.videoWidth) return;
-  // 画面使用 object-fit: cover,需要换算
-  const vw = video.videoWidth, vh = video.videoHeight, cw = ov.width, ch = ov.height, sc = Math.max(cw / vw, ch / vh);
-  const dw = vw * sc, dh = vh * sc, ox = (cw - dw) / 2, oy = (ch - dh) / 2;
-  octx.lineWidth = 2.5 * devicePixelRatio; octx.font = `${13 * devicePixelRatio}px sans-serif`;
-  for (const b of lastBoxes) {
-    const x = ox + b.box[0] * dw, y = oy + b.box[1] * dh, w = (b.box[2] - b.box[0]) * dw, h = (b.box[3] - b.box[1]) * dh, col = colorOf(b.label);
-    octx.strokeStyle = col; octx.strokeRect(x, y, w, h);
-    const t = `${b.zh || b.label} ${(b.score * 100) | 0}%`, tw = octx.measureText(t).width + 10 * devicePixelRatio;
-    octx.fillStyle = col; octx.fillRect(x, Math.max(0, y - 20 * devicePixelRatio), tw, 20 * devicePixelRatio);
-    octx.fillStyle = "#000"; octx.fillText(t, x + 5 * devicePixelRatio, Math.max(14 * devicePixelRatio, y - 6 * devicePixelRatio));
-  }
-}
-async function detectOnce() {
-  if (!camOn || detBusy || !video.videoWidth) return; detBusy = true;
-  try {
-    const sc = Math.min(1, 512 / video.videoWidth); grab.width = video.videoWidth * sc; grab.height = video.videoHeight * sc;
-    grab.getContext("2d").drawImage(video, 0, 0, grab.width, grab.height);
-    const blob = await new Promise((r) => grab.toBlob(r, "image/jpeg", 0.72));
-    const q = new URLSearchParams({ labels: $("labels").value.replace(/，/g, ","), thr: "0.15" });
-    const res = await fetch("/api/detect?" + q, { method: "POST", body: blob }); const j = await res.json();
-    if (j.error) { $("detinfo").textContent = "检测不可用"; } else {
-      lastBoxes = j.boxes; const cnt = {}; j.boxes.forEach((b) => { const k = b.zh || b.label; cnt[k] = (cnt[k] || 0) + 1; });
-      lastLabels = Object.keys(cnt); $("detinfo").textContent = `${j.boxes.length} 个物体 · ${j.ms}ms`;
-      $("chips").innerHTML = Object.entries(cnt).map(([k, v]) => `<span class="ch">${k}<i>×${v}</i></span>`).join("");
-    }
-  } catch (e) {}
-  detBusy = false;
-}
-$("cam").onclick = async () => {
-  if (camOn) { camOn = false; camStream.getTracks().forEach((t) => t.stop()); video.srcObject = null; $("cam").textContent = "📷 开启摄像头"; $("vph").style.display = "grid"; clearInterval(detTimer); lastBoxes = []; lastLabels = []; $("chips").innerHTML = ""; $("detinfo").textContent = "未开启"; drawBoxes(); return; }
-  try { camStream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 960 }, height: { ideal: 720 }, facingMode: "environment" } }); }
-  catch (e) { toast("无法访问摄像头:请允许权限(需要 HTTPS 页面)", 5000); return; }
-  video.srcObject = camStream; await video.play(); camOn = true; $("cam").textContent = "⏹ 关闭摄像头"; $("vph").style.display = "none";
-  detTimer = setInterval(detectOnce, 220); (function loop() { if (camOn) { drawBoxes(); requestAnimationFrame(loop); } })();
-};
-$("askSee").onclick = () => { if (!camOn) { toast("请先开启摄像头"); return; } seeMode = true; $("tgVision").classList.add("on"); sendChat("我的摄像头里现在能看到什么?请用一两句话告诉我。"); };
 
 /* ---------------- 入口 & 标签页 ---------------- */
 $("enter").onclick = () => { player.ensure(); $("gate").style.display = "none"; };
