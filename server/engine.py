@@ -1,5 +1,6 @@
 """引擎:GPU 进程池 + 声音训练流水线 + 对话/语音流水线。"""
 import asyncio
+import base64
 import json
 import multiprocessing as mp
 import queue as pyqueue
@@ -24,11 +25,7 @@ class Worker:
     def __init__(self, name: str, kind: str, gpu: int, loop: asyncio.AbstractEventLoop):
         from .workers import worker_main
 
-        ctx = mp.get_context("spawn")
         self.name, self.kind, self.gpu, self.loop = name, kind, gpu, loop
-        self.inq, self.outq = ctx.Queue(), ctx.Queue()
-        self.cancel = ctx.Value("q", 0)
-        self.proc = ctx.Process(target=worker_main, args=(kind, gpu, self.inq, self.outq, self.cancel), daemon=True)
         self.pending: dict[int, asyncio.Queue] = {}
         self.next_id = 1
         self.inflight = 0
@@ -36,17 +33,39 @@ class Worker:
         self.error = None
         self.info: dict = {}
         self.busy_ms = 0.0
+        self._spawn()
+
+    def _spawn(self):
+        from .workers import worker_main
+
+        ctx = mp.get_context("spawn")
+        self.inq, self.outq = ctx.Queue(), ctx.Queue()
+        self.cancel = ctx.Value("q", 0)
+        self.proc = ctx.Process(target=worker_main, args=(self.kind, self.gpu, self.inq, self.outq, self.cancel), daemon=True)
 
     def start(self):
         self.proc.start()
-        threading.Thread(target=self._reader, daemon=True, name="reader-" + self.name).start()
+        threading.Thread(target=self._reader, args=(self.proc, self.outq), daemon=True, name="reader-" + self.name).start()
 
-    def _reader(self):
+    def respawn(self):
+        """进程崩溃(OOM-kill 等)后,重新拉起一个干净的进程。"""
+        try:
+            if self.proc.is_alive():
+                self.proc.terminate()
+        except Exception:  # noqa: BLE001
+            pass
+        self.pending.clear()
+        self.inflight = 0
+        self.next_id = 1
+        self._spawn()
+        self.start()
+
+    def _reader(self, proc, outq):
         while True:
             try:
-                msg = self.outq.get(timeout=1.0)
+                msg = outq.get(timeout=1.0)
             except pyqueue.Empty:
-                if not self.proc.is_alive():
+                if not proc.is_alive():
                     break
                 continue
             except (EOFError, OSError):
@@ -54,7 +73,19 @@ class Worker:
             try:
                 self.loop.call_soon_threadsafe(self._dispatch, msg)
             except RuntimeError:
-                break
+                return
+        try:  # 进程已退出:让所有正在等待它的请求立刻失败,而不是永远等下去
+            self.loop.call_soon_threadsafe(self._fail_all, proc)
+        except RuntimeError:
+            pass
+
+    def _fail_all(self, proc):
+        if proc is not self.proc:
+            return
+        self.state = "error"
+        self.error = "工作进程 %s 意外退出(可能显存不足被系统终止),点「重新加载模型」即可恢复" % self.name
+        for rid, q in list(self.pending.items()):
+            q.put_nowait({"id": rid, "type": "error", "error": self.error})
 
     def _dispatch(self, msg):
         q = self.pending.get(msg["id"])
@@ -74,11 +105,11 @@ class Worker:
         self.pending.pop(rid, None)
         self.inflight = max(0, self.inflight - 1)
 
-    async def call(self, op: str, **args):
+    async def call(self, op: str, _timeout: float | None = None, **args):
         rid, q = self.submit(op, **args)
         try:
             while True:
-                m = await q.get()
+                m = await (asyncio.wait_for(q.get(), _timeout) if _timeout else q.get())
                 if m["type"] == "error":
                     raise RuntimeError(m["error"])
                 if m["type"] == "final":
@@ -86,10 +117,14 @@ class Worker:
         finally:
             self._done(rid)
 
-    async def stream(self, rid, q):
+    async def stream(self, rid, q, stall: float = 90.0):
         try:
             while True:
-                m = await q.get()
+                try:
+                    m = await asyncio.wait_for(q.get(), stall)
+                except asyncio.TimeoutError:
+                    self.cancel.value = max(self.cancel.value, rid)
+                    raise RuntimeError("%s 超过 %d 秒没有响应" % (self.name, int(stall)))
                 if m["type"] == "error":
                     raise RuntimeError(m["error"])
                 if m["type"] == "delta":
@@ -143,12 +178,37 @@ def _gpu_stats_raw():
         return []
 
 
+class TurnLog:
+    """一轮对话的事件日志(文本/音频/状态)。与任何网络连接解耦:连接断了,服务端照样生成;
+    客户端重连后用游标 after=N 继续取,绝不丢数据 —— 这是「100% 稳定连接」的核心。"""
+
+    def __init__(self, tid: int):
+        self.tid = tid
+        self.events: list[dict] = []
+        self.done = False
+        self.ev = asyncio.Event()
+        self.created = time.time()
+
+    def push(self, obj: dict):
+        self.events.append(obj)
+        self.ev.set()
+
+    def finish(self):
+        if not self.done:
+            self.done = True
+            self.ev.set()
+
+
 class Session:
-    def __init__(self):
+    def __init__(self, sid: str = ""):
+        self.sid = sid
         self.history: list[dict] = []
         self.task: asyncio.Task | None = None
         self.turn = 0
         self.llm_rid = 0
+        self.log: TurnLog | None = None
+        self.tid_seq = 0
+        self.touched = time.time()
 
     def trim(self):
         total, keep = 0, []
@@ -178,6 +238,7 @@ class Engine:
         self.turn_stats: dict = {}
         self.fillers: list[dict] = []
         self._last_filler = -1
+        self.sessions: dict[str, Session] = {}
 
     # ---------- 启动 ----------
     async def start(self):
@@ -249,6 +310,8 @@ class Engine:
         for w in self.workers:
             if w.state == "error":
                 names.append(w.name)
+                if not w.proc.is_alive():
+                    w.respawn()
                 asyncio.create_task(self._load(w))
         return names
 
@@ -265,6 +328,8 @@ class Engine:
         failed = [w for w in [*self.tts, self.aux] if w and w.state == "error"]
         for w in failed:
             self._log("重新加载 %s …" % w.name)
+            if not w.proc.is_alive():
+                w.respawn()
             asyncio.create_task(self._load(w))
         await self._wait_loaded([*self.tts, self.aux])
         ws = self.ready_tts()
@@ -338,8 +403,8 @@ class Engine:
     def _set(self, **kw):
         self.job.update(kw)
 
-    async def start_training(self, audio: bytes, ref_text: str):
-        if self.job.get("state") == "running":
+    async def start_training(self, audio: bytes, ref_text: str, lang: str = "zh"):
+        if self.job.get("state") == "running" and time.time() - self.job.get("started", 0) < 900:
             raise RuntimeError("训练正在进行中")
         n = max(1, len(self.tts))
         self.job = {
@@ -347,13 +412,36 @@ class Engine:
             "gpus": [{"gpu": w.gpu, "progress": 0, "msg": "等待"} for w in self.tts[:n]],
             "similarity": None, "quality": None, "started": time.time(),
         }
-        asyncio.create_task(self._train(audio, ref_text.strip()))
+        asyncio.create_task(self._train(audio, ref_text.strip(), lang))
 
     def _gpu_msg(self, i, progress, msg):
-        if i < len(self.job.get("gpus", [])):
-            self.job["gpus"][i].update(progress=progress, msg=msg)
+        gs = self.job.get("gpus", [])
+        if i < len(gs):
+            gs[i].update(progress=progress, msg=msg)
+        if gs and self.job.get("state") == "running":
+            avg = sum(g["progress"] for g in gs) / len(gs)
+            self.job["progress"] = max(self.job.get("progress", 0), int(15 + 0.8 * avg))
 
-    async def _train(self, audio: bytes, ref_text: str):
+    async def _get_ref_text(self, ref, ref_text, aux_ok, lang):
+        if ref_text:
+            return ref_text
+        if not aux_ok:
+            self._log("⚠ 语音识别模型未就绪,本次只用 x-vector 模式(不需要文本)")
+            return ""
+        self._set(stage="自动识别参考语音文本 (Whisper @ GPU%d)" % self.aux.gpu)
+        try:
+            r = await self.aux.call("asr", _timeout=120, samples=au.resample(ref, config.SR, 16000), lang=lang)
+            self._log("识别文本: %s" % r["text"])
+            return r["text"]
+        except Exception as e:  # noqa: BLE001
+            self._log("⚠ 语音识别失败,本次只用 x-vector 模式: %s" % (str(e).strip().splitlines() or ["?"])[-1])
+            return ""
+
+    async def _train(self, audio: bytes, ref_text: str, lang_hint: str = "zh"):
+        """加速版流水线: 两张卡从第一秒起就同时干活。
+        GPU0: 提取 x-vector 声纹 → 合成校验句 → 相似度;   aux(GPU1): Whisper 识别文本
+        GPU1: (等文本) 提取 ICL 上下文 → 合成校验句 → 相似度;   最后把胜出的模式补到另一张卡。
+        语气词缓存放到后台,不再占用训练时间。"""
         try:
             self._set(stage="等待模型加载", progress=3)
             tts_ws = await self._ensure_ready()
@@ -375,77 +463,96 @@ class Engine:
             cur.mkdir(parents=True, exist_ok=True)
             ref_path = cur / ("ref_%s.wav" % vid)  # 每次训练换新文件名,避免 TTS 内部按路径缓存到旧声音
             await asyncio.to_thread(au.write_wav, ref_path, ref, config.SR)
-            # 2. 自动转写
-            if not ref_text and not aux_ok:
-                raise ValueError("语音识别模型未就绪,无法自动识别参考文本。请在「参考文本」框里手动填写你朗读的内容。")
-            if not ref_text:
-                self._set(stage="自动识别参考语音文本 (Whisper @ GPU%d)" % self.aux.gpu, progress=18)
-                r = await self.aux.call("asr", samples=au.resample(ref, config.SR, 16000))
-                ref_text = r["text"]
-                self._log("识别文本: %s" % ref_text)
-            # 3. 双卡同时构建声音 prompt
-            self._set(stage="双卡并行提取声纹/声学特征", progress=30)
-            for w_ in tts_ws:
-                self._gpu_msg(self.tts.index(w_), 10, "提取中")
-
-            async def prep(i, w):
-                i = self.tts.index(w)
-                r = await w.call("prepare", voice_id=vid, ref_path=str(ref_path), ref_text=ref_text)
-                self._gpu_msg(i, 45, "特征就绪 %s" % "+".join(r["modes"]))
-                return r
-
-            results = await asyncio.gather(*[prep(i, w) for i, w in enumerate(tts_ws)])
-            modes = results[0]["modes"]
-            # 4. 双卡并行合成测试句:不同克隆模式分配到不同的卡上同时评估,并择优
-            self._set(stage="双卡并行合成校验 & 相似度评估", progress=55)
-            zh = detect_language(ref_text or "你好") == "Chinese"
+            ref16 = au.resample(ref, config.SR, 16000)
+            ref_db = au.to_db(au.rms(ref))
+            zh = lang_hint != "en"
+            if ref_text:
+                zh = detect_language(ref_text) == "Chinese"
             test = "今天天气真不错,我们一起去公园散步吧。" if zh else "The weather is lovely today, let's take a walk in the park."
             lang = "Chinese" if zh else "English"
-            ref16 = au.resample(ref, config.SR, 16000)
+
+            # 2. 双卡并行
+            self._set(stage="双卡并行:声纹提取 + 文本识别 + 合成校验", progress=15)
+            for w_ in tts_ws:
+                self._gpu_msg(self.tts.index(w_), 5, "等待")
+            w0 = tts_ws[0]
+            w1 = tts_ws[1] if len(tts_ws) > 1 else tts_ws[0]
+            text_task = asyncio.create_task(self._get_ref_text(ref, ref_text, aux_ok, "zh" if zh else "en"))
+            prepared: dict[str, set] = {}
             scores: dict[str, float] = {}
 
-            async def one(mi, mode):
-                w = tts_ws[mi % len(tts_ws)]
+            async def eval_mode(w, mode, text):
                 i = self.tts.index(w)
-                self._gpu_msg(i, 60, "合成测试句(%s)" % mode)
+                self._gpu_msg(i, 15, "提取声纹(%s)" % mode)
+                await w.call("prepare", _timeout=300, voice_id=vid, ref_path=str(ref_path), ref_text=text, modes=[mode])
+                prepared.setdefault(w.name, set()).add(mode)
+                self._gpu_msg(i, 50, "合成校验句(%s)" % mode)
                 wav, sr = await self.synth_collect(w, vid, test, lang, mode)
-                wav = au.postprocess_chunk(wav, sr, au.to_db(au.rms(ref)), True, 0.0)
+                wav = await asyncio.to_thread(au.postprocess_chunk, wav, sr, ref_db, True, 0.0)
                 if not aux_ok:
+                    self._gpu_msg(i, 90, "%s 就绪" % mode)
                     return mode, None
-                s_ = await self.aux.call("sim", a=ref16, b=au.resample(wav, sr, 16000))
+                s_ = await self.aux.call("sim", _timeout=120, a=ref16, b=au.resample(wav, sr, 16000))
                 self._gpu_msg(i, 90, "%s 相似度 %.1f%%" % (mode, s_["cosine"] * 100))
                 return mode, s_["cosine"]
 
-            res = await asyncio.gather(*[one(mi, m) for mi, m in enumerate(modes)], return_exceptions=True)
+            async def path_x():
+                return await eval_mode(w0, "xvec", "")
+
+            async def path_i():
+                text = await text_task
+                if not text:
+                    return None
+                return await eval_mode(w1, "icl", text)
+
+            res = await asyncio.gather(path_x(), path_i(), return_exceptions=True)
+            text = await text_task
             for r in res:
                 if isinstance(r, Exception):
                     self._log("模式评估失败: %s" % (str(r).strip().splitlines() or [repr(r)])[-1])
-                elif r[1] is not None:
-                    scores[r[0]] = float(r[1])
-                    self._log("模式 %s 说话人相似度 %.2f%%" % (r[0], r[1] * 100))
-            self._set(progress=88)
-            if not scores:
-                best = modes[0]
-            else:
-                best = max(scores, key=scores.get)
+                elif r is not None:
+                    self._log("模式 %s 说话人相似度 %s" % (r[0], "%.2f%%" % (r[1] * 100) if r[1] is not None else "N/A"))
+                    if r[1] is not None:
+                        scores[r[0]] = float(r[1])
+            ok_modes = [m for ws_ in prepared.values() for m in ws_]
+            if not ok_modes:
+                raise RuntimeError("所有克隆模式都失败了:" + "; ".join(str(r) for r in res if isinstance(r, Exception))[-300:])
+            best = max(scores, key=scores.get) if scores else ("icl" if "icl" in ok_modes else "xvec")
             sim = scores.get(best)
-            # 5. 生效
+            # 3. 把胜出的模式补到另一张卡,保证双卡都能合成
+            self._set(stage="同步声音到双卡", progress=90)
+
+            async def ensure(w):
+                i = self.tts.index(w)
+                if best in prepared.get(w.name, set()):
+                    self._gpu_msg(i, 100, "完成")
+                    return w.name
+                try:
+                    self._gpu_msg(i, 92, "同步 %s 声纹" % best)
+                    await w.call("prepare", _timeout=300, voice_id=vid, ref_path=str(ref_path), ref_text=text, modes=[best])
+                    self._gpu_msg(i, 100, "完成")
+                    return w.name
+                except Exception as e:  # noqa: BLE001
+                    self._log("%s 同步失败: %s" % (w.name, (str(e).strip().splitlines() or ["?"])[-1]))
+                    return None
+
+            names = [n for n in await asyncio.gather(*[ensure(w) for w in tts_ws]) if n]
+            if not names:
+                raise RuntimeError("声音同步失败")
             self.voice = {
-                "id": vid, "ref_path": str(ref_path), "ref_file": ref_path.name, "ref_text": ref_text, "mode": best,
-                "similarity": sim, "scores": scores, "target_rms_db": au.to_db(au.rms(ref)),
-                "quality": quality, "trained_at": time.time(), "modes": modes,
-                "lang": "Chinese" if zh else "English",
-                "workers": [w.name for w in tts_ws],
+                "id": vid, "ref_path": str(ref_path), "ref_file": ref_path.name, "ref_text": text, "mode": best,
+                "similarity": sim, "scores": scores, "target_rms_db": ref_db,
+                "quality": quality, "trained_at": time.time(), "modes": sorted(set(ok_modes)),
+                "lang": "Chinese" if zh else "English", "workers": names,
             }
             (cur / "meta.json").write_text(
                 json.dumps({k: v for k, v in self.voice.items() if k != "ref_path"}, ensure_ascii=False), "utf-8"
             )
-            self._set(stage="双卡并行生成「思考语气词」缓存(0 延迟首声)", progress=94)
-            await self._make_fillers()
-            for w_ in tts_ws:
-                self._gpu_msg(self.tts.index(w_), 100, "完成")
-            self._set(state="done", stage="训练完成", progress=100, similarity=sim, mode=best, ref_text=ref_text)
-            self._log("完成,选用模式 %s,相似度 %s" % (best, "%.2f%%" % (sim * 100) if sim is not None else "N/A"))
+            self.fillers = []
+            self._set(state="done", stage="训练完成", progress=100, similarity=sim, mode=best, ref_text=text,
+                      elapsed=round(time.time() - self.job.get("started", time.time()), 1))
+            self._log("完成(%.1fs),选用模式 %s,相似度 %s" % (self.job["elapsed"], best, "%.2f%%" % (sim * 100) if sim is not None else "N/A"))
+            asyncio.create_task(self._make_fillers())  # 语气词缓存放后台,训练完立刻可用
         except Exception as e:  # noqa: BLE001
             msg = str(e).strip().splitlines()[-1] if str(e).strip() else repr(e)
             self._set(state="error", stage="失败", error=msg)
@@ -454,8 +561,8 @@ class Engine:
 
     # ---------- 语气词缓存 ----------
     async def _make_fillers(self):
-        self.fillers = []
         v = self.voice
+        fl: list[dict] = []
         texts = config.FILLERS.get((v or {}).get("lang", ""), [])
         if not texts or not self.ready_tts():
             return
@@ -469,8 +576,10 @@ class Engine:
         res = await asyncio.gather(*[one(t) for t in texts], return_exceptions=True)
         for t, r in zip(texts, res):
             if isinstance(r, dict) and r["dur"] > 0.15:
-                self.fillers.append(r)
-        print("[engine] 语气词缓存 %d/%d 就绪" % (len(self.fillers), len(texts)), flush=True)
+                fl.append(r)
+        if self.voice is v:  # 期间没有被新的训练替换
+            self.fillers = fl
+        print("[engine] 语气词缓存 %d/%d 就绪" % (len(fl), len(texts)), flush=True)
 
     def pick_filler(self):
         if not self.fillers:
@@ -520,7 +629,7 @@ class Engine:
             return
         post, t0 = None, time.time()
         try:
-            async for d in w.stream(rid, q):
+            async for d in w.stream(rid, q, stall=60):
                 if post is None:
                     post = au.StreamPost(d["sr"], v.get("target_rms_db"), trim_head=True)
                 pcm = post.feed(d["pcm"])
@@ -542,6 +651,89 @@ class Engine:
     # ---------- 对话 ----------
     def new_session(self) -> Session:
         return Session()
+
+    # ---------- 与连接无关的对话接口(HTTP 长轮询) ----------
+    def get_session(self, sid: str) -> Session:
+        now = time.time()
+        for k in [k for k, v in self.sessions.items() if now - v.touched > 6 * 3600 and not (v.task and not v.task.done())]:
+            self.sessions.pop(k, None)
+        sess = self.sessions.get(sid)
+        if sess is None:
+            sess = self.sessions[sid] = Session(sid)
+        sess.touched = now
+        return sess
+
+    async def start_chat(self, sid: str, text: str, opts: dict, speak_only: bool) -> int:
+        sess = self.get_session(sid)
+        self.cancel_turn(sess)
+        if sess.task and not sess.task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(sess.task), timeout=0.6)
+            except Exception:  # noqa: BLE001
+                pass
+        sess.tid_seq += 1
+        log = TurnLog(sess.tid_seq)
+        sess.log = log
+        opts = dict(opts or {})
+        opts["speak_only"] = speak_only
+
+        def push_json(obj):
+            log.push(obj)
+
+        async def emit_json(obj):
+            push_json(obj)
+
+        async def emit_audio(turn, idx, sr, pcm):
+            log.push({"type": "audio", "turn": turn, "idx": idx, "sr": sr, "b64": base64.b64encode(pcm).decode("ascii")})
+
+        async def guarded():
+            try:
+                await self.run_turn(sess, text, opts, emit_json, emit_audio)
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:  # noqa: BLE001  任何意外都必须让界面看到
+                log.push({"type": "error", "text": "服务端异常: " + (str(e).strip().splitlines() or [repr(e)])[-1]})
+            finally:
+                log.finish()
+
+        sess.task = asyncio.create_task(guarded())
+        return log.tid
+
+    async def poll_events(self, sid: str, tid: int, after: int, wait: float = 15.0) -> dict:
+        sess = self.get_session(sid)
+        log = sess.log
+        if log is None or log.tid != tid:
+            return {"events": [], "next": after, "done": True, "superseded": True}
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, min(wait, 25.0))
+        while len(log.events) <= after and not log.done:
+            log.ev.clear()
+            if len(log.events) > after or log.done:
+                break
+            rem = deadline - loop.time()
+            if rem <= 0:
+                break
+            try:
+                await asyncio.wait_for(log.ev.wait(), rem)
+            except asyncio.TimeoutError:
+                break
+        if len(log.events) > after and not log.done and len(log.events) - after < 3:
+            await asyncio.sleep(0.02)  # 合并相邻事件,减少请求数
+        evs = log.events[after:after + 200]
+        nxt = after + len(evs)
+        return {"events": evs, "next": nxt, "done": log.done and nxt >= len(log.events)}
+
+    def stop_chat(self, sid: str):
+        sess = self.get_session(sid)
+        self.cancel_turn(sess)
+        if sess.log and not sess.log.done:
+            sess.log.push({"type": "stopped"})
+            sess.log.finish()
+
+    def reset_chat(self, sid: str):
+        sess = self.get_session(sid)
+        self.stop_chat(sid)
+        sess.history.clear()
 
     async def run_turn(self, sess: Session, text: str, opts: dict, emit_json, emit_audio):
         t0 = time.time()
@@ -646,7 +838,7 @@ class Engine:
                 sess.llm_rid = rid
                 full = []
                 try:
-                    async for delta in self.llm.stream(rid, q):
+                    async for delta in self.llm.stream(rid, q, stall=config.LLM_FIRST_TOKEN_TIMEOUT + 30):
                         if stats["llm_first_ms"] is None:
                             stats["llm_first_ms"] = round((time.time() - t0) * 1000)
                         full.append(delta)
