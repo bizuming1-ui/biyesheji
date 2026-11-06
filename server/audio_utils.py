@@ -132,6 +132,19 @@ def preprocess_reference(x: np.ndarray, sr: int = SR, max_seconds: float = 20.0)
     return x, q, warnings
 
 
+def soft_limit(x: np.ndarray, knee: float = 0.8) -> np.ndarray:
+    """带膝点的软限幅:|x|<knee 完全线性(不引入任何失真/沙沙感),只有接近满幅的峰值才被柔和压缩 → 不会爆音。"""
+    x = np.asarray(x, dtype=np.float32)
+    a = np.abs(x)
+    over = a > knee
+    if not over.any():
+        return x
+    y = x.copy()
+    room = 1.0 - knee
+    y[over] = np.sign(x[over]) * (knee + room * np.tanh((a[over] - knee) / room))
+    return y
+
+
 def make_breath(sr: int, level: float, rng: np.random.Generator) -> np.ndarray:
     """极弱的吸气声(带通噪声 + 起伏包络)。level 0~1,0 表示关闭。"""
     if level <= 0.01:
@@ -174,7 +187,7 @@ def postprocess_chunk(
     if x.size > fade * 2:
         x[:fade] *= np.linspace(0, 1, fade, dtype=np.float32)
         x[-fade:] *= np.linspace(1, 0, fade, dtype=np.float32)
-    x = np.tanh(x * 1.1) / np.tanh(1.1)  # 软限幅,避免削波爆音
+    x = soft_limit(x)  # 软限幅,避免削波爆音
     if not first and breath_level > 0.01:
         br = make_breath(sr, breath_level, rng)
         if br.size:
@@ -205,6 +218,7 @@ class StreamPost:
         self.first = True
         self.trim_head = trim_head
         self.sent = 0
+        self.gate_g = 1.0  # 下行扩展器(底噪门)的上一个增益,跨块连续
 
     def _gain_from(self, x: np.ndarray) -> float:
         if self.target is None:
@@ -218,6 +232,26 @@ class StreamPost:
         fr = x[: k * n].reshape(k, n)[voiced[:k]]
         cur = to_db(rms(fr))
         return float(np.clip(10 ** ((self.target - cur) / 20.0), 0.4, 2.5))
+
+    def _floor_gate(self, x: np.ndarray) -> np.ndarray:
+        """下行扩展器:词与词之间、句尾的底噪(沙沙声)被平滑压低最多 ~16dB;语音本身不动。
+        10ms 帧、增益线性插值(无台阶 → 无爆音),状态跨块连续。"""
+        n = max(1, int(self.sr * 0.010))
+        k = x.size // n
+        if k < 1:
+            return x
+        fr = np.sqrt(np.mean(x[: k * n].reshape(k, n).astype(np.float64) ** 2, axis=1)) + 1e-9
+        ref = 10 ** ((self.target if self.target is not None else -22.0) / 20.0)
+        thr = ref * 0.06  # ≈ 比平均语音电平低 24dB 以下视为底噪
+        tgt = np.clip((fr / thr) ** 0.7, 0.15, 1.0)
+        g = np.empty(k + 1, dtype=np.float64)
+        g[0] = self.gate_g
+        for i in range(k):  # 快开(立刻放行语音)、慢关(避免吃掉尾音)
+            g[i + 1] = tgt[i] if tgt[i] > g[i] else g[i] + 0.35 * (tgt[i] - g[i])
+        self.gate_g = float(g[-1])
+        pos = np.arange(x.size, dtype=np.float64) / n
+        gain = np.interp(pos, np.arange(k + 1), g).astype(np.float32)
+        return (x * gain).astype(np.float32)
 
     def feed(self, chunk: np.ndarray) -> np.ndarray:
         from scipy.signal import sosfilt
@@ -243,7 +277,8 @@ class StreamPost:
         if self.gain is None:
             self.gain = 1.0
         x = x * self.gain
-        x = np.tanh(x * 1.1) / np.tanh(1.1)
+        x = self._floor_gate(x)
+        x = soft_limit(x)
         x = np.concatenate([self.tail, x.astype(np.float32)])
         if x.size <= self.TAIL:
             self.tail = x
