@@ -46,6 +46,12 @@ SYSTEM_PROMPT = (
     "当用户要求长篇内容(故事、文章、讲解)时,请完整、连贯、有条理地充分展开,不要中途停止。"
 )
 
+# 对话大模型(Qwen3-4B fp16 ≈ 7.5GiB)按层均分到两张卡,每卡只占约 3.8GiB,
+# 这样每张 T4(≈14.5GiB)都能同时放下:TTS(≈4.5GiB) + LLM 一半 + 其它,不再 OOM。
+LLM_SPLIT = os.environ.get("LLM_SPLIT", "1") == "1"
+LLM_MAX_MEM_GIB = float(os.environ.get("LLM_MAX_MEM_GIB", "4.6"))
+TTS_LOAD_RETRIES = int(os.environ.get("TTS_LOAD_RETRIES", "2"))
+
 TTS_DTYPE = os.environ.get("TTS_DTYPE", "float16")  # T4 无原生 bf16;若输出异常会自动回退 bfloat16
 LLM_DTYPE = os.environ.get("LLM_DTYPE", "float16")
 
