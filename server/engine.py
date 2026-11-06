@@ -218,8 +218,7 @@ class Engine:
             "job": self.job,
             "turn": self.turn_stats,
             "fillers": len(self.fillers),
-            "models": {"tts": config.TTS_MODEL, "llm": config.LLM_MODEL, "asr": config.ASR_MODEL, "det": config.DET_MODEL},
-            "labels": [{"en": e, "zh": z} for e, z in config.DETECT_LABELS],
+            "models": {"tts": config.TTS_MODEL, "llm": config.LLM_MODEL, "asr": config.ASR_MODEL},
         }
 
     def voice_public(self):
@@ -234,7 +233,7 @@ class Engine:
             return
         try:
             v = json.loads(meta.read_text("utf-8"))
-            v["ref_path"] = str(config.VOICE_DIR / "current" / "ref.wav")
+            v["ref_path"] = str(config.VOICE_DIR / "current" / v.get("ref_file", "ref.wav"))
             await self._wait_ready(self.ready_tts() or self.tts)
             await asyncio.gather(*[
                 w.call("prepare", voice_id=v["id"], ref_path=v["ref_path"], ref_text=v.get("ref_text", ""))
@@ -286,7 +285,7 @@ class Engine:
             if cur.exists():
                 shutil.rmtree(cur, ignore_errors=True)
             cur.mkdir(parents=True, exist_ok=True)
-            ref_path = cur / "ref.wav"
+            ref_path = cur / ("ref_%s.wav" % vid)  # 每次训练换新文件名,避免 TTS 内部按路径缓存到旧声音
             await asyncio.to_thread(au.write_wav, ref_path, ref, config.SR)
             # 2. 自动转写
             if not ref_text:
@@ -306,34 +305,32 @@ class Engine:
 
             results = await asyncio.gather(*[prep(i, w) for i, w in enumerate(self.tts)])
             modes = results[0]["modes"]
-            # 4. 双卡并行合成测试句,计算相似度并择优
+            # 4. 双卡并行合成测试句:不同克隆模式分配到不同的卡上同时评估,并择优
             self._set(stage="双卡并行合成校验 & 相似度评估", progress=55)
             zh = detect_language(ref_text or "你好") == "Chinese"
-            tests = (
-                ["今天天气真不错,我们一起去公园散步吧。", "慢慢来,别着急,深呼吸,一切都会好起来的。"]
-                if zh
-                else ["The weather is lovely today, let's take a walk in the park.", "Take your time, breathe slowly, everything will be fine."]
-            )
+            test = "今天天气真不错,我们一起去公园散步吧。" if zh else "The weather is lovely today, let's take a walk in the park."
             lang = "Chinese" if zh else "English"
             ref16 = au.resample(ref, config.SR, 16000)
             scores: dict[str, float] = {}
-            for mi, mode in enumerate(modes):
-                async def one(i, w, mode=mode):
-                    t = tests[i % len(tests)]
-                    self._gpu_msg(i, 50 + 20 * mi, "合成测试句(%s)" % mode)
-                    out = await w.call("synth", voice_id=vid, text=t, lang=lang, mode=mode)
-                    wav = au.postprocess_chunk(out["wav"], out["sr"], au.to_db(au.rms(ref)), True, 0.0)
-                    s = await self.aux.call("sim", a=ref16, b=au.resample(wav, out["sr"], 16000))
-                    self._gpu_msg(i, 60 + 20 * mi, "%s 相似度 %.1f%%" % (mode, s["cosine"] * 100))
-                    return s["cosine"]
 
-                try:
-                    sims = await asyncio.gather(*[one(i, w) for i, w in enumerate(self.tts)])
-                    scores[mode] = float(np.mean(sims))
-                    self._log("模式 %s 平均说话人相似度 %.2f%%" % (mode, scores[mode] * 100))
-                except Exception as e:  # noqa: BLE001
-                    self._log("模式 %s 评估失败: %s" % (mode, str(e).strip().splitlines()[-1]))
-                self._set(progress=55 + 18 * (mi + 1))
+            async def one(mi, mode):
+                i = mi % len(self.tts)
+                w = self.tts[i]
+                self._gpu_msg(i, 60, "合成测试句(%s)" % mode)
+                wav, sr = await self.synth_collect(w, vid, test, lang, mode)
+                wav = au.postprocess_chunk(wav, sr, au.to_db(au.rms(ref)), True, 0.0)
+                s_ = await self.aux.call("sim", a=ref16, b=au.resample(wav, sr, 16000))
+                self._gpu_msg(i, 90, "%s 相似度 %.1f%%" % (mode, s_["cosine"] * 100))
+                return mode, s_["cosine"]
+
+            res = await asyncio.gather(*[one(mi, m) for mi, m in enumerate(modes)], return_exceptions=True)
+            for r in res:
+                if isinstance(r, Exception):
+                    self._log("模式评估失败: %s" % (str(r).strip().splitlines() or [repr(r)])[-1])
+                else:
+                    scores[r[0]] = float(r[1])
+                    self._log("模式 %s 说话人相似度 %.2f%%" % (r[0], r[1] * 100))
+            self._set(progress=88)
             if not scores:
                 best = modes[0]
             else:
@@ -341,7 +338,7 @@ class Engine:
             sim = scores.get(best)
             # 5. 生效
             self.voice = {
-                "id": vid, "ref_path": str(ref_path), "ref_text": ref_text, "mode": best,
+                "id": vid, "ref_path": str(ref_path), "ref_file": ref_path.name, "ref_text": ref_text, "mode": best,
                 "similarity": sim, "scores": scores, "target_rms_db": au.to_db(au.rms(ref)),
                 "quality": quality, "trained_at": time.time(), "modes": modes,
                 "lang": "Chinese" if zh else "English",
@@ -366,12 +363,19 @@ class Engine:
         self.fillers = []
         v = self.voice
         texts = config.FILLERS.get((v or {}).get("lang", ""), [])
-        if not texts:
+        if not texts or not self.ready_tts():
             return
-        res = await asyncio.gather(*[self.synth(t, True, 0.0) for t in texts], return_exceptions=True)
+
+        async def one(t):
+            w = self._pick_tts()
+            wav, sr = await self.synth_collect(w, v["id"], t, v["lang"], v["mode"])
+            wav = await asyncio.to_thread(au.postprocess_chunk, wav, sr, v.get("target_rms_db"), True, 0.0, self.rng)
+            return {"text": t, "pcm": au.to_pcm16(wav), "sr": sr, "dur": len(wav) / sr}
+
+        res = await asyncio.gather(*[one(t) for t in texts], return_exceptions=True)
         for t, r in zip(texts, res):
             if isinstance(r, dict) and r["dur"] > 0.15:
-                self.fillers.append({"text": t, "pcm": r["pcm"], "sr": r["sr"], "dur": r["dur"]})
+                self.fillers.append(r)
         print("[engine] 语气词缓存 %d/%d 就绪" % (len(self.fillers), len(texts)), flush=True)
 
     def pick_filler(self):
@@ -391,16 +395,53 @@ class Engine:
             raise RuntimeError("TTS 模型尚未就绪")
         return min(ws, key=lambda w: (w.inflight, w.busy_ms))
 
-    async def synth(self, text: str, first: bool, breath: float):
+    def _cancel_tts(self):
+        """让所有 TTS 卡立刻放弃排队中/进行中的合成(用户点停止或开始新一轮时)。"""
+        for w in self.tts:
+            w.cancel.value = max(w.cancel.value, w.next_id - 1)
+
+    async def synth_collect(self, w: Worker, voice_id: str, text: str, lang: str, mode: str):
+        """整句合成(训练评估/语气词缓存用):收集所有流式块 → (wav, sr)。"""
+        rid, q = w.submit("synth", voice_id=voice_id, text=text, lang=lang, mode=mode, chunk=config.TTS_CHUNK_NEXT)
+        parts, sr = [], config.SR
+        async for d in w.stream(rid, q):
+            parts.append(d["pcm"])
+            sr = d["sr"]
+        if not parts:
+            raise RuntimeError("TTS 没有产出音频")
+        return np.concatenate(parts).astype(np.float32), sr
+
+    async def synth_stream(self, text: str, first: bool, out: asyncio.Queue):
+        """合成一句话:每个流式块经「带状态后处理」后放入 out;结束放入 None。出错放入 {"error"}。"""
         v = self.voice
-        w = self._pick_tts()
-        t0 = time.time()
-        out = await w.call("synth", voice_id=v["id"], text=text, lang=detect_language(text), mode=v["mode"])
-        w.busy_ms += (time.time() - t0) * 1000
-        wav = await asyncio.to_thread(
-            au.postprocess_chunk, out["wav"], out["sr"], v.get("target_rms_db"), first, breath, self.rng
-        )
-        return {"pcm": au.to_pcm16(wav), "sr": out["sr"], "dur": len(wav) / out["sr"], "gpu": w.gpu, "ms": (time.time() - t0) * 1000}
+        try:
+            w = self._pick_tts()
+            chunk = config.TTS_CHUNK_FIRST if first else config.TTS_CHUNK_NEXT
+            rid, q = w.submit("synth", voice_id=v["id"], text=text, lang=detect_language(text), mode=v["mode"], chunk=chunk)
+        except Exception as e:  # noqa: BLE001
+            await out.put({"error": str(e)})
+            await out.put(None)
+            return
+        post, t0 = None, time.time()
+        try:
+            async for d in w.stream(rid, q):
+                if post is None:
+                    post = au.StreamPost(d["sr"], v.get("target_rms_db"), trim_head=True)
+                pcm = post.feed(d["pcm"])
+                if pcm.size:
+                    await out.put({"pcm": au.to_pcm16(pcm), "sr": d["sr"], "dur": pcm.size / d["sr"], "gpu": w.gpu})
+            if post is not None:
+                tail = post.finish()
+                if tail.size:
+                    await out.put({"pcm": au.to_pcm16(tail), "sr": post.sr, "dur": tail.size / post.sr, "gpu": w.gpu})
+        except asyncio.CancelledError:
+            w.cancel.value = max(w.cancel.value, rid)
+            raise
+        except Exception as e:  # noqa: BLE001
+            await out.put({"error": (str(e).strip().splitlines() or [repr(e)])[-1]})
+        finally:
+            w.busy_ms += (time.time() - t0) * 1000
+            await out.put(None)
 
     # ---------- 对话 ----------
     def new_session(self) -> Session:
@@ -413,43 +454,51 @@ class Engine:
         speak_only = opts.get("speak_only", False)
         breath = float(opts.get("breath", 0.4))
         long_mode = bool(opts.get("long", False))
-        vision = [str(s)[:40] for s in (opts.get("vision") or [])][:20]
         has_voice = self.voice is not None and bool(self.ready_tts())
         use_filler = bool(opts.get("filler", True)) and not speak_only
         stats = {"turn": turn, "chunks": 0, "audio_s": 0.0, "ttfa_ms": None, "body_ttfa_ms": None, "llm_first_ms": None, "gpu_chunks": {}, "filler": None}
-        await emit_json({"type": "start", "turn": turn, "voice": has_voice})
+        filler = self.pick_filler() if (use_filler and has_voice) else None
+        base_idx = 1 if filler else 0
+        await emit_json({"type": "start", "turn": turn, "voice": has_voice, "filler": bool(filler)})
         if not has_voice:
             await emit_json({"type": "notice", "text": "还没有训练声音,本次只输出文字。请先录制/上传参考语音并点击「开始训练」。"})
 
         chunker = SentenceChunker()
         order: asyncio.Queue = asyncio.Queue()
 
-        filler = self.pick_filler() if (use_filler and has_voice) else None
-        base_idx = 1 if filler else 0
-
         async def emitter():
-            idx = base_idx
+            idx, n_sent = base_idx, 0
             while True:
-                t = await order.get()
-                if t is None:
+                sq = await order.get()
+                if sq is None:
                     return
-                try:
-                    r = await t
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:  # noqa: BLE001
-                    await emit_json({"type": "warn", "text": "语音片段合成失败: " + str(e).strip().splitlines()[-1][:200]})
-                    continue
-                if stats["body_ttfa_ms"] is None:
-                    stats["body_ttfa_ms"] = round((time.time() - t0) * 1000)
-                if stats["ttfa_ms"] is None:
-                    stats["ttfa_ms"] = stats["body_ttfa_ms"]
-                await emit_audio(turn, idx, r["sr"], r["pcm"])
-                stats["chunks"] += 1
-                stats["audio_s"] += r["dur"]
-                g = "gpu%d" % r["gpu"]
-                stats["gpu_chunks"][g] = stats["gpu_chunks"].get(g, 0) + 1
-                idx += 1
+                first_piece = True
+                while True:
+                    item = await sq.get()
+                    if item is None:
+                        break
+                    if "error" in item:
+                        await emit_json({"type": "warn", "text": "语音片段合成失败: " + item["error"][:200]})
+                        continue
+                    if first_piece and n_sent > 0 and n_sent % 2 == 1 and breath > 0.01:
+                        br = au.make_breath(item["sr"], breath, self.rng)
+                        if br.size:
+                            br = np.concatenate([br, np.zeros(int(item["sr"] * 0.03), dtype=np.float32)])
+                            await emit_audio(turn, idx, item["sr"], au.to_pcm16(br))
+                            idx += 1
+                            stats["chunks"] += 1
+                    first_piece = False
+                    if stats["body_ttfa_ms"] is None:
+                        stats["body_ttfa_ms"] = round((time.time() - t0) * 1000)
+                    if stats["ttfa_ms"] is None:
+                        stats["ttfa_ms"] = stats["body_ttfa_ms"]
+                    await emit_audio(turn, idx, item["sr"], item["pcm"])
+                    stats["chunks"] += 1
+                    stats["audio_s"] += item["dur"]
+                    g = "gpu%d" % item["gpu"]
+                    stats["gpu_chunks"][g] = stats["gpu_chunks"].get(g, 0) + 1
+                    idx += 1
+                n_sent += 1
 
         em_task = asyncio.create_task(emitter())
         if filler:
@@ -469,10 +518,16 @@ class Engine:
             cleaned = clean_for_tts(piece)
             if not is_speakable(cleaned):
                 return
-            task = asyncio.create_task(self.synth(cleaned, n_sub == 0, breath))
+            sq: asyncio.Queue = asyncio.Queue()
+            synth_tasks.append(asyncio.create_task(self.synth_stream(cleaned, n_sub == 0, sq)))
             n_sub += 1
-            synth_tasks.append(task)
-            order.put_nowait(task)
+            order.put_nowait(sq)
+
+        def abort():
+            for t in synth_tasks:
+                t.cancel()
+            em_task.cancel()
+            self._cancel_tts()
 
         try:
             if speak_only:
@@ -481,8 +536,6 @@ class Engine:
                 await emit_json({"type": "text", "delta": text})
             else:
                 sys_prompt = config.SYSTEM_PROMPT
-                if vision:
-                    sys_prompt += "\n[摄像头实时画面中检测到的物体]: " + "、".join(vision) + "。用户问到眼前的东西时请据此回答。"
                 msgs = [{"role": "system", "content": sys_prompt}, *sess.history, {"role": "user", "content": text}]
                 sess.history.append({"role": "user", "content": text})
                 max_new = config.LLM_LONG_TOKENS if long_mode else config.LLM_DEFAULT_TOKENS
@@ -490,22 +543,30 @@ class Engine:
                     msgs[0]["content"] += "\n" + config.FILLER_HINT % filler["text"].rstrip(",")
                 if long_mode:
                     msgs[0]["content"] += "\n本次请尽可能详尽、完整、有层次地长篇回答。"
-                if self.llm.state != "ready":
-                    raise RuntimeError("对话模型尚未加载完成,请稍候")
+                if self.llm is None or self.llm.state != "ready":
+                    detail = (self.llm.error or "") if self.llm else ""
+                    raise RuntimeError("对话模型尚未加载完成或加载失败。" + (detail.strip().splitlines()[-1] if detail.strip() else "请稍候或查看 Kaggle 输出日志"))
                 rid, q = self.llm.submit("chat", messages=msgs, max_new_tokens=max_new)
                 sess.llm_rid = rid
                 full = []
-                async for delta in self.llm.stream(rid, q):
-                    if stats["llm_first_ms"] is None:
-                        stats["llm_first_ms"] = round((time.time() - t0) * 1000)
-                    full.append(delta)
-                    await emit_json({"type": "text", "delta": delta})
-                    for p in chunker.feed(delta):
-                        submit(p)
+                try:
+                    async for delta in self.llm.stream(rid, q):
+                        if stats["llm_first_ms"] is None:
+                            stats["llm_first_ms"] = round((time.time() - t0) * 1000)
+                        full.append(delta)
+                        await emit_json({"type": "text", "delta": delta})
+                        for p in chunker.feed(delta):
+                            submit(p)
+                finally:
+                    if full:
+                        sess.history.append({"role": "assistant", "content": "".join(full)})
+                        sess.trim()
+                    elif sess.history and sess.history[-1]["role"] == "user":
+                        sess.history.pop()  # 没有产出内容 → 不把这条用户消息留在历史里
                 for p in chunker.flush():
                     submit(p)
-                sess.history.append({"role": "assistant", "content": "".join(full)})
-                sess.trim()
+                if not full:
+                    raise RuntimeError("对话模型没有返回任何内容")
             order.put_nowait(None)
             await em_task
             stats["total_ms"] = round((time.time() - t0) * 1000)
@@ -513,16 +574,12 @@ class Engine:
             self.turn_stats = stats
             await emit_json({"type": "done", "turn": turn, "stats": stats})
         except asyncio.CancelledError:
-            for t in synth_tasks:
-                t.cancel()
-            em_task.cancel()
+            abort()
             if sess.llm_rid and self.llm:
-                self.llm.cancel.value = sess.llm_rid
+                self.llm.cancel.value = max(self.llm.cancel.value, sess.llm_rid)
             raise
         except Exception as e:  # noqa: BLE001
-            for t in synth_tasks:
-                t.cancel()
-            em_task.cancel()
+            abort()
             msg = str(e).strip().splitlines()[-1] if str(e).strip() else repr(e)
             await emit_json({"type": "error", "text": msg})
             print("[turn] 失败:\n%s" % e, flush=True)
@@ -530,10 +587,11 @@ class Engine:
     def cancel_turn(self, sess: Session):
         if sess.llm_rid and self.llm:
             self.llm.cancel.value = max(self.llm.cancel.value, sess.llm_rid)
+        self._cancel_tts()
         if sess.task and not sess.task.done():
             sess.task.cancel()
 
-    # ---------- ASR / 检测 ----------
+    # ---------- ASR ----------
     async def transcribe(self, data: bytes) -> dict:
         if self.aux is None or self.aux.state != "ready":
             raise RuntimeError("语音识别模型尚未就绪")
@@ -541,17 +599,6 @@ class Engine:
         if x.size < 1600:
             return {"text": ""}
         return await self.aux.call("asr", samples=x)
-
-    async def detect(self, jpeg: bytes, labels: list[str], thr: float) -> dict:
-        if self.aux is None or self.aux.state != "ready":
-            raise RuntimeError("检测模型尚未就绪")
-        en = [config.ZH2EN.get(l.strip(), l.strip()) for l in labels if l.strip()]
-        if not en:
-            en = [e for e, _ in config.DETECT_LABELS]
-        r = await self.aux.call("detect", jpeg=jpeg, labels=en, thr=thr)
-        for b in r["boxes"]:
-            b["zh"] = config.EN2ZH.get(b["label"], b["label"])
-        return r
 
 
 def _split_all(text: str):
