@@ -46,7 +46,8 @@ class MockTTS:
     def prepare(self, args, emit):
         time.sleep(0.3)
         self.voices[args["voice_id"]] = True
-        modes = ["icl", "xvec"] if (args.get("ref_text") or "").strip() else ["xvec"]
+        want = args.get("modes") or ["icl", "xvec"]
+        modes = [m for m in want if m != "icl" or (args.get("ref_text") or "").strip()]
         return {"modes": modes}
 
     def synth(self, args, emit, cancelled=lambda: False):
@@ -200,26 +201,26 @@ class RealTTS:
     # ---- 声音 prompt ----
     def prepare(self, args, emit):
         """构建/预热可复用的声音克隆 prompt(ICL 与 x-vector 两种都构建,后续择优)。"""
-        vid, path, text = args["voice_id"], args["ref_path"], (args.get("ref_text") or "").strip()
-        self.preps[vid] = args
-        modes = []
-        if text:
-            modes.append("icl")
-        modes.append("xvec")
+        vid = args["voice_id"]
+        old = self.preps.get(vid, {})
+        text = (args.get("ref_text") or old.get("ref_text") or "").strip()
+        self.preps[vid] = {**old, **args, "ref_text": text}
+        want = args.get("modes") or (["icl"] if text else []) + ["xvec"]
+        modes = [m for m in want if m != "icl" or text]
         lang = "Chinese" if any("\u4e00" <= c <= "\u9fff" for c in text) or not text else "English"
-        for m in modes:  # 真实合成一小句 → 缓存声纹 + 让 CUDA Graph 完全热起来
-            for _ in self._gen(vid, "嗯。" if lang == "Chinese" else "Hmm.", lang, m, chunk=8):
+        for m in modes:  # 真实合成一小句(很短) → 缓存声纹 + 让 CUDA Graph 完全热起来
+            for _ in self._gen(vid, "嗯。" if lang == "Chinese" else "Hmm.", lang, m, chunk=8, max_new=36):
                 pass
         return {"modes": modes}
 
     # ---- 合成 ----
-    def _gen(self, vid, text, lang, mode, chunk, cancelled=lambda: False):
+    def _gen(self, vid, text, lang, mode, chunk, cancelled=lambda: False, max_new=None):
         a = self.preps[vid]
         ref, ref_text = a["ref_path"], (a.get("ref_text") or "").strip()
         if mode == "icl" and not ref_text:
             mode = "xvec"
-        max_new = int(min(1200, max(72, len(text) * 6 + 48)))
-        kw = dict(temperature=0.8, top_k=40, top_p=0.95, repetition_penalty=1.05)
+        max_new = int(max_new or min(1200, max(72, len(text) * 6 + 48)))
+        kw = dict(temperature=config.TTS_TEMPERATURE, top_k=config.TTS_TOP_K, top_p=config.TTS_TOP_P, repetition_penalty=1.05)
         if self.fast is not None:
             for audio, sr, _timing in self.fast.generate_voice_clone_streaming(
                 text=text, language=lang, ref_audio=ref, ref_text=ref_text,
@@ -441,13 +442,30 @@ class RealAux:
             self.sv = WavLMForXVector.from_pretrained(config.SV_MODEL).to(self.dev).eval()
         except Exception as e:  # noqa: BLE001
             self.errors["sv"] = repr(e)
+        try:  # 预热:第一次真实使用时不再卡 cuDNN/内核编译
+            z = np.zeros(16000, dtype=np.float32) + 1e-4 * np.random.randn(16000).astype(np.float32)
+            if self.asr_pipe is not None:
+                self.asr_pipe({"raw": z, "sampling_rate": 16000})
+            if self.sv is not None:
+                self._embed(z)
+        except Exception as e:  # noqa: BLE001
+            print("[aux] 预热失败(不影响使用): %s" % _last_line(e), flush=True)
         return {"device": "cuda(GPU%d)" % self.gpu, "asr": self.asr_pipe is not None, "sv": self.sv is not None, "errors": self.errors}
 
     def asr(self, args, emit):
         if self.asr_pipe is None:
             raise RuntimeError("ASR 未加载: %s" % self.errors.get("asr"))
         x = np.asarray(args["samples"], dtype=np.float32)  # 16k
-        out = self.asr_pipe({"raw": x, "sampling_rate": 16000}, chunk_length_s=30, return_timestamps=False)
+        kw = {}
+        if x.size > 16000 * 29:  # 短音频不分块,更快、更准
+            kw.update(chunk_length_s=30, return_timestamps=False)
+        lang = {"zh": "chinese", "en": "english"}.get(str(args.get("lang") or ""), None)
+        if lang:
+            kw["generate_kwargs"] = {"language": lang, "task": "transcribe"}
+        try:
+            out = self.asr_pipe({"raw": x, "sampling_rate": 16000}, **kw)
+        except Exception:  # noqa: BLE001  语言参数在个别版本不被接受 → 退回自动检测
+            out = self.asr_pipe({"raw": x, "sampling_rate": 16000}, chunk_length_s=30)
         return {"text": (out.get("text") or "").strip()}
 
     def _embed(self, x16):
