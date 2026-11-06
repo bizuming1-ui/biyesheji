@@ -88,16 +88,15 @@
   .bar{display:flex;gap:8px;align-items:center}
   .iconbtn{width:44px;height:44px;border-radius:14px;flex:none;display:grid;place-items:center;font-size:19px;background:rgba(255,255,255,.07);border:1px solid var(--line)}
   .iconbtn.on{background:rgba(251,113,133,.25);border-color:var(--bad);animation:pulse 1.1s infinite}
+  #errbar{display:none;margin:0 0 8px;padding:8px 12px;border-radius:12px;background:rgba(251,113,133,.14);border:1px solid rgba(251,113,133,.5);color:#ffd3da;font-size:12px;line-height:1.6;align-items:center;gap:10px}
+  #errbar.show{display:flex}
+  #errbar span{flex:1;word-break:break-all}
   .opts{display:flex;gap:8px;flex-wrap:wrap;align-items:center;font-size:12px;color:var(--mut)}
   .tg{display:flex;align-items:center;gap:6px;padding:5px 10px;border-radius:10px;background:rgba(255,255,255,.05);border:1px solid var(--line);cursor:pointer;user-select:none}
   .tg.on{color:#fff;background:rgba(124,92,255,.28);border-color:rgba(124,92,255,.7)}
   input[type=range]{accent-color:var(--a1);width:70px}
   #viz{height:26px;width:90px;border-radius:8px;background:rgba(0,0,0,.25)}
   .state{display:flex;align-items:center;gap:8px;margin-left:auto}
-  /* right: detect */
-  .vid{position:relative;border-radius:14px;overflow:hidden;background:#000;aspect-ratio:4/3;flex:none}
-  .vid video,.vid canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
-  .vid .ph{position:absolute;inset:0;display:grid;place-items:center;color:var(--mut);font-size:12px;text-align:center;line-height:1.8}
   #chips{display:flex;flex-wrap:wrap;gap:6px;align-content:flex-start;flex:1;min-height:0;overflow:hidden}
   .ch{padding:4px 10px;border-radius:999px;font-size:12px;background:rgba(34,211,238,.12);border:1px solid rgba(34,211,238,.35);color:#c9f6ff}
   .ch i{font-style:normal;color:var(--mut);margin-left:4px}
@@ -143,6 +142,7 @@
     <div class="chip hide-n"><span>声音</span><b id="vstate">未训练</b></div>
   </header>
 
+  <div id="errbar"><span id="errtxt"></span><button class="btn pri" id="reload" style="padding:6px 14px">🔄 重新加载模型</button></div>
   <main data-tab="chat" id="main">
     <!-- ① 克隆 -->
     <section class="card" id="c-clone">
@@ -276,10 +276,20 @@ async function pollStatus() {
     const v = s.voice;
     $("vstate").textContent = v ? "已训练" + (v.similarity != null ? " · " + (v.similarity * 100).toFixed(1) + "%" : "") : "未训练";
     const errs = Object.entries(w).filter(([, x]) => x.state === "error");
-    if (errs.length && !pollStatus.warned) { pollStatus.warned = 1; toast("模型加载失败: " + errs[0][0] + ",请看 Kaggle 输出日志", 6000); }
+    const eb = $("errbar");
+    if (errs.length) {
+      const last = (x) => ((x.error || "").trim().split("\n").pop() || "未知原因").slice(0, 220);
+      $("errtxt").textContent = "⚠ 模型加载失败 — " + errs.map(([k, x]) => k + ": " + last(x)).join(" | ");
+      eb.classList.add("show");
+    } else eb.classList.remove("show");
   } catch (e) { /* 服务重启中 */ }
 }
 setInterval(pollStatus, 2000); pollStatus();
+
+$("reload").onclick = async () => {
+  try { const r = await (await fetch("/api/reload", { method: "POST" })).json(); toast("正在重新加载: " + (r.reloading || []).join(", "), 4000); pollStatus(); }
+  catch (e) { toast("请求失败: " + e.message, 4000); }
+};
 
 /* ---------------- 录音(克隆参考) ---------------- */
 let refBlob = null, recorder = null, recStream = null, recStart = 0, recTimer = null, recAC = null, recAn = null, waveRAF = 0;
@@ -359,13 +369,15 @@ async function pollJob() {
 }
 
 /* ---------------- WebSocket / 对话 ---------------- */
+let pendingChat = null, lastPong = performance.now();
 let lastMsgAt = 0, gotStart = false, ws = null, wsReady = false, tSend = 0, curBubble = null, autoPlay = true, longMode = false, fillerOn = true;
 function setConn(ok) { const d = $("d-conn"); if (d) { d.className = "dot " + (ok ? "ok" : "err"); $("t-conn").textContent = ok ? "已连接" : "重连中"; } }
 function connectWS() {
   ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws"); ws.binaryType = "arraybuffer";
-  ws.onopen = () => { wsReady = true; setConn(true); };
-  ws.onclose = () => { wsReady = false; setConn(false); if (curBubble) { addMsg("e", "⚠ 与服务器的连接中断,正在自动重连…(如果持续失败,请确认 Kaggle 单元格仍在运行)"); endBubble(); } setTimeout(connectWS, 1200); };
+  ws.onopen = () => { wsReady = true; lastPong = performance.now(); setConn(true); if (pendingChat) { const t = pendingChat; pendingChat = null; doSend(t); } };
+  ws.onclose = () => { wsReady = false; setConn(false); if (curBubble) { addMsg("e", "⚠ 与服务器的连接中断,正在自动重连…(如果持续失败,请确认 Kaggle 单元格仍在运行)"); endBubble(); } setTimeout(connectWS, 600); };
   ws.onmessage = (ev) => {
+    if (typeof ev.data === "string" && ev.data.indexOf('"pong"') > 0) { lastPong = performance.now(); return; }
     lastMsgAt = performance.now();
     if (typeof ev.data !== "string") {
       const dv = new DataView(ev.data), turn = dv.getUint32(0, true), idx = dv.getUint32(4, true), sr = dv.getUint32(8, true);
@@ -388,7 +400,14 @@ function connectWS() {
     } else if (m.type === "stopped") { player.stop(); endBubble(); }
   };
 }
-connectWS(); setInterval(() => wsReady && ws.send('{"type":"ping"}'), 20000);
+connectWS();
+/* 心跳:每 8 秒一次;30 秒收不到 pong 就主动断开重连(隧道偶尔会悄悄丢掉 WebSocket,以前就是这样「发了没反应」) */
+setInterval(() => {
+  if (!wsReady) return;
+  try { ws.send('{"type":"ping"}'); } catch (e) {}
+  if (performance.now() - lastPong > 30000) { try { ws.close(); } catch (e) {} }
+}, 8000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden && wsReady) { try { ws.send('{"type":"ping"}'); } catch (e) {} } });
 /* 看门狗:发送后如果服务端长时间没有任何输出,必须明确告诉用户,而不是一直转圈 */
 setInterval(() => {
   if (!curBubble) return;
@@ -407,12 +426,19 @@ function addMsg(cls, text) {
   const d = document.createElement("div"); d.className = "msg " + cls; d.textContent = text; m.appendChild(d); scrollDown(); return d;
 }
 function endBubble() { if (curBubble) { curBubble.classList.remove("live"); curBubble = null; } }
+function doSend(text) {
+  curBubble = addMsg("a live", ""); tSend = performance.now(); lastMsgAt = tSend; gotStart = false;
+  send({ type: "chat", text, opts: { long: longMode, breath: $("breath").value / 100, filler: fillerOn } });
+}
 function sendChat(text) {
   text = (text || "").trim(); if (!text) return false;
-  if (!wsReady) { toast("正在连接服务器,请稍候再发送…", 3000); return false; }
   player.ensure(); player.stop(); endBubble();
-  addMsg("u", text); curBubble = addMsg("a live", ""); tSend = performance.now(); lastMsgAt = tSend; gotStart = false;
-  send({ type: "chat", text, opts: { long: longMode, breath: $("breath").value / 100, filler: fillerOn } });
+  addMsg("u", text);   // 无论连接是否正常,消息先显示出来,绝不「点了没反应」
+  if (!wsReady) {
+    pendingChat = text; addMsg("s", "⏳ 正在重新连接服务器,连上后会自动发送这条消息…");
+    return true;
+  }
+  doSend(text);
   return true;
 }
 $("send").onclick = () => { const v = $("input").value; if (sendChat(v)) $("input").value = ""; };
