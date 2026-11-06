@@ -39,6 +39,8 @@ class MockTTS:
 
     def load(self, args, emit):
         time.sleep(0.4)
+        if os.environ.get("MOCK_FAIL_TTS") == str(self.gpu):  # 测试用:模拟某张卡 TTS 加载失败
+            raise RuntimeError("模拟的 TTS 加载失败(MOCK_FAIL_TTS=%d)" % self.gpu)
         return {"device": "mock:%d" % self.gpu, "engine": "mock-stream"}
 
     def prepare(self, args, emit):
@@ -110,6 +112,25 @@ def _from_pretrained(cls, name, dtype, **kw):
         return cls.from_pretrained(name, torch_dtype=dtype, **kw)
 
 
+def free_cuda():
+    """加载失败/回退前必须释放半加载的模型,否则显存泄漏会让第二次加载 OOM。"""
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _last_line(e) -> str:
+    return (str(e).strip().splitlines() or [repr(e)])[-1][:300]
+
+
 class RealTTS:
     def __init__(self, gpu):
         self.gpu, self.model, self.fast = gpu, None, None
@@ -123,6 +144,7 @@ class RealTTS:
 
         dt = getattr(torch, dtype_name)
         self.fast = None
+        fast_err = None
         try:
             from faster_qwen3_tts import FasterQwen3TTS
 
@@ -136,12 +158,24 @@ class RealTTS:
             except Exception as e:  # noqa: BLE001
                 print("[tts gpu%d] CUDA Graph 预热失败(首次合成时再捕获): %s" % (self.gpu, e), flush=True)
         except Exception as e:  # noqa: BLE001
-            print("[tts gpu%d] faster-qwen3-tts 不可用,回退官方 qwen-tts(整句合成,较慢): %s" % (self.gpu, e), flush=True)
-            self.fast = None
-            from qwen_tts import Qwen3TTSModel
+            fast_err = e
+            self.fast = self.model = None
+            free_cuda()  # 关键:先释放半加载的模型,再尝试回退,否则会 OOM
+            print("[tts gpu%d] faster-qwen3-tts 加载失败: %s" % (self.gpu, _last_line(e)), flush=True)
+        if self.fast is None:
+            if fast_err is not None and "out of memory" in str(fast_err).lower():
+                raise RuntimeError("TTS 显存不足(GPU%d): %s" % (self.gpu, _last_line(fast_err)))
+            try:
+                from qwen_tts import Qwen3TTSModel
 
-            self.model = _from_pretrained(Qwen3TTSModel, config.TTS_MODEL, dt, device_map="cuda", attn_implementation="sdpa")
-            self.engine_name = "qwen-tts(官方,非流式)"
+                self.model = _from_pretrained(Qwen3TTSModel, config.TTS_MODEL, dt, device_map="cuda", attn_implementation="sdpa")
+                self.engine_name = "qwen-tts(官方,非流式)"
+            except Exception as e2:  # noqa: BLE001
+                free_cuda()
+                raise RuntimeError(
+                    "TTS 模型加载失败。faster-qwen3-tts: %s | qwen-tts: %s。"
+                    "请确认依赖: transformers==5.15.1 + qwen-tts-hf(不要同时装 qwen-tts)" % (_last_line(fast_err), _last_line(e2))
+                )
         self.dtype_name = dtype_name
 
     def load(self, args, emit):
@@ -246,11 +280,21 @@ class RealLLM:
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         self.tok = AutoTokenizer.from_pretrained(config.LLM_MODEL)
-        self.model = _from_pretrained(AutoModelForCausalLM, config.LLM_MODEL, getattr(torch, self.dtype_name))
-        self.model = self.model.to("cuda").eval()
-        self.dev = "cuda"
+        n = torch.cuda.device_count()
+        if config.LLM_SPLIT and n >= 2:
+            # 两张卡各放一半层(顺序执行,速度≈单卡,但每卡显存占用减半)
+            mm = {i: "%.1fGiB" % config.LLM_MAX_MEM_GIB for i in range(n)}
+            self.model = _from_pretrained(
+                AutoModelForCausalLM, config.LLM_MODEL, getattr(torch, self.dtype_name),
+                device_map="auto", max_memory=mm,
+            ).eval()
+            where = "GPU0+GPU1(各一半)"
+        else:
+            self.model = _from_pretrained(AutoModelForCausalLM, config.LLM_MODEL, getattr(torch, self.dtype_name)).to("cuda").eval()
+            where = "GPU0"
+        self.dev = "cuda:0"
         self._warm()
-        return {"device": "cuda(GPU%d)" % self.gpu, "dtype": self.dtype_name}
+        return {"device": where, "dtype": self.dtype_name}
 
     def _warm(self):
         import torch
@@ -473,4 +517,6 @@ def worker_main(kind: str, gpu: int, inq, outq, cancel_val) -> None:
             outq.put({"id": rid, "type": "error", "error": traceback.format_exc()})
             if op == "load":
                 handler = None
+                if not config.MOCK:
+                    free_cuda()
         sys.stdout.flush()
