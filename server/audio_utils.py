@@ -182,6 +182,85 @@ def postprocess_chunk(
     return x.astype(np.float32)
 
 
+class StreamPost:
+    """流式后处理(逐块、带状态,块与块之间无缝、无爆音)。
+
+    - 60Hz 二阶高通(带滤波器状态,跨块连续) → 去直流/低频噪声
+    - 响度:用第一块里「有声部分」估算一次增益,整句保持不变(避免逐块忽大忽小造成颤音/沙沙感)
+    - 句首 10ms 淡入;每块保留最后 8ms 暂不发送,与下一块拼接 → 句末才做淡出,中途零接缝
+    - tanh 软限幅,避免削波爆音
+    """
+
+    TAIL = int(SR * 0.008)
+
+    def __init__(self, sr: int, target_rms_db: float | None, trim_head: bool = True):
+        from scipy.signal import butter, sosfilt_zi
+
+        self.sr = sr
+        self.target = target_rms_db
+        self.sos = butter(2, 60.0, btype="highpass", fs=sr, output="sos")
+        self.zi = sosfilt_zi(self.sos) * 0.0
+        self.gain = None
+        self.tail = np.zeros(0, dtype=np.float32)
+        self.first = True
+        self.trim_head = trim_head
+        self.sent = 0
+
+    def _gain_from(self, x: np.ndarray) -> float:
+        if self.target is None:
+            return 1.0
+        db = _frame_db(x, self.sr)
+        voiced = db > (db.max() - 30.0)
+        n = max(1, int(self.sr * 0.02))
+        k = len(x) // n
+        if k == 0 or not voiced.any():
+            return 1.0
+        fr = x[: k * n].reshape(k, n)[voiced[:k]]
+        cur = to_db(rms(fr))
+        return float(np.clip(10 ** ((self.target - cur) / 20.0), 0.4, 2.5))
+
+    def feed(self, chunk: np.ndarray) -> np.ndarray:
+        from scipy.signal import sosfilt
+
+        x = np.asarray(chunk, dtype=np.float32).reshape(-1)
+        if x.size == 0:
+            return x
+        x, self.zi = sosfilt(self.sos, x, zi=self.zi)
+        x = x.astype(np.float32)
+        if self.first:
+            if self.trim_head:  # 去掉模型输出开头的静音/杂音,更快出声
+                db = _frame_db(x, self.sr)
+                idx = np.where(db > db.max() - 40.0)[0]
+                if idx.size:
+                    cut = max(0, idx[0] * int(self.sr * 0.02) - int(self.sr * 0.02))
+                    x = x[cut:]
+            if x.size == 0:
+                return x
+            self.gain = self._gain_from(x)
+            f = min(int(self.sr * 0.010), x.size)
+            x[:f] *= np.linspace(0, 1, f, dtype=np.float32)
+            self.first = False
+        if self.gain is None:
+            self.gain = 1.0
+        x = x * self.gain
+        x = np.tanh(x * 1.1) / np.tanh(1.1)
+        x = np.concatenate([self.tail, x.astype(np.float32)])
+        if x.size <= self.TAIL:
+            self.tail = x
+            return np.zeros(0, dtype=np.float32)
+        out, self.tail = x[: -self.TAIL], x[-self.TAIL:]
+        self.sent += out.size
+        return out
+
+    def finish(self) -> np.ndarray:
+        t = self.tail
+        self.tail = np.zeros(0, dtype=np.float32)
+        if t.size:
+            t = t.copy()
+            t *= np.linspace(1, 0, t.size, dtype=np.float32)
+        return t
+
+
 def to_pcm16(x: np.ndarray) -> bytes:
     return (np.clip(x, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
 
