@@ -63,6 +63,10 @@ def main():
         check("train done with one card", job.get("state") == "done", job.get("error") or job.get("stage"))
         v = c.get("/api/status").json()["voice"]
         check("voice uses tts0 only", v and v.get("workers") == ["tts0"], v and v.get("workers"))
+        for _ in range(40):  # 训练时会自动重试失败的卡;等它再次失败后再手动重载
+            if c.get("/api/status").json()["workers"]["tts1"]["state"] == "error":
+                break
+            time.sleep(0.5)
         r = c.post("/api/reload")
         check("reload endpoint", r.status_code == 200 and r.json().get("reloading") == ["tts1"], r.text)
         check("favicon no 404", c.get("/favicon.ico").status_code == 204)
