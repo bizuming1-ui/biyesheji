@@ -1,4 +1,6 @@
 faster-qwen3-tts
+qwen-tts-hf>=0.1.1.post1
+transformers==5.15.1
 fastapi
 uvicorn[standard]
 python-multipart
