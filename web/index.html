@@ -121,6 +121,58 @@
     .hide-n{display:none}
   }
 </style>
+<script>
+/* ===== 检测探针 v1 =====
+   记录所有 /api 请求(耗时/状态码/失败)、按钮点击、JS 错误、音频/麦克风状态;
+   ① 每 4 秒批量上报服务端 /api/clientlog(出现在 /api/diag 与检测日志里)
+   ② 同时 postMessage 给「浏览器模拟器」(右上角检测日志面板实时显示) */
+(function () {
+  var RING = [], Q = [], MAX = 300, of = window.fetch.bind(window), ST = {};
+  function emit(e) {
+    e.t = Date.now(); RING.push(e); if (RING.length > MAX) RING.shift(); Q.push(e); if (Q.length > 200) Q.shift();
+    try { if (window.parent !== window) window.parent.postMessage({ vc: 1, entry: e }, "*"); } catch (_) {}
+  }
+  window.__VC_LOG = RING; window.__vcEmit = emit;
+  function cls(url) { var m = /\/api\/([a-z/]+)/.exec(url); return m ? m[1] : "other"; }
+  window.fetch = function (u, o) {
+    var url = typeof u === "string" ? u : (u && u.url) || "", m = (o && o.method) || "GET", t0 = performance.now();
+    if (/\/api\/clientlog/.test(url)) return of(u, o);
+    var k = cls(url), s = ST[k] = ST[k] || { n: 0, fail: 0, sum: 0, max: 0 };
+    return of(u, o).then(function (r) {
+      var ms = Math.round(performance.now() - t0); s.n++; s.sum += ms; if (ms > s.max) s.max = ms;
+      var routine = /^(ping|status|events|voice\/job)$/.test(k);
+      if (!r.ok || !routine) emit({ kind: "http", method: m, url: url.replace(/sid=[^&]+/, "sid=*").slice(0, 120), status: r.status, ms: ms });
+      return r;
+    }, function (err) {
+      s.n++; s.fail++;
+      emit({ kind: "http-fail", method: m, url: url.replace(/sid=[^&]+/, "sid=*").slice(0, 120), ms: Math.round(performance.now() - t0), msg: String((err && err.message) || err) });
+      throw err;
+    });
+  };
+  window.addEventListener("error", function (e) { emit({ kind: "js-error", msg: (e.message || "") + " @" + (e.filename || "").split("/").pop() + ":" + (e.lineno || 0) }); });
+  window.addEventListener("unhandledrejection", function (e) { emit({ kind: "js-error", msg: "Promise: " + String((e.reason && e.reason.message) || e.reason) }); });
+  document.addEventListener("click", function (e) {
+    var b = e.target && e.target.closest && e.target.closest("button,[id]");
+    if (b && b.id) emit({ kind: "ui", msg: "点击 #" + b.id + (b.disabled ? " (按钮被禁用,未生效)" : "") });
+  }, true);
+  document.addEventListener("visibilitychange", function () { emit({ kind: "ui", msg: "页面 " + document.visibilityState }); });
+  window.addEventListener("online", function () { emit({ kind: "net", msg: "浏览器恢复联网" }); });
+  window.addEventListener("offline", function () { emit({ kind: "net", msg: "浏览器断网" }); });
+  setInterval(function () {
+    var o = {}; for (var k in ST) { var s = ST[k]; o[k] = { n: s.n, fail: s.fail, avg: s.n ? Math.round(s.sum / s.n) : 0, max: s.max }; }
+    var ac = window.player && window.player.ctx;
+    emit({ kind: "stats", extra: JSON.stringify({ http: o, audio: ac ? { state: ac.state, sr: ac.sampleRate, underruns: window.player.underruns, hold: window.player.hold } : null }) });
+  }, 10000);
+  setInterval(function () {
+    if (!Q.length) return; var b = Q.splice(0, Q.length);
+    of("/api/clientlog", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b), keepalive: true }).catch(function () {});
+  }, 4000);
+  window.addEventListener("message", function (e) {
+    if (e.data && e.data.vcPing) { try { window.parent.postMessage({ vc: 1, backlog: RING.slice(-120) }, "*"); } catch (_) {} }
+  });
+  emit({ kind: "env", msg: "页面载入", extra: JSON.stringify({ ua: navigator.userAgent, secure: window.isSecureContext, mic: !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia), rec: typeof MediaRecorder !== "undefined", ac: typeof (window.AudioContext || window.webkitAudioContext) !== "undefined", framed: window.parent !== window }) });
+})();
+</script>
 </head>
 <body>
 <div id="gate"><div class="box">
@@ -254,7 +306,7 @@ class GaplessPlayer {
     if (this.total !== null && this.expect >= this.total && this.srcs.size === 0) { this.onstate("idle"); if (this.underruns === 0) this.hold = Math.max(0, this.hold - 0.15); }
   }
 }
-const player = new GaplessPlayer();
+const player = new GaplessPlayer(); window.player = player;
 
 let jobTimer = null;
 /* ---------------- 状态轮询 ---------------- */
@@ -341,6 +393,8 @@ $("train").onclick = async () => {
   if (!refBlob) return;
   const fd = new FormData(); fd.append("file", refBlob, "ref.webm"); fd.append("text", $("reftext").value); fd.append("lang", scriptIdx % SCRIPTS.length === 2 ? "en" : "zh");
   $("train").disabled = true; $("result").style.display = "none"; $("warns").textContent = "";
+  $("pall").style.width = "2%"; $("gl").innerHTML = '<span class="m" style="color:#cfd6ff">已点击开始训练 · 正在上传参考音频(' + (refBlob.size / 1024).toFixed(0) + ' KB)…</span>';
+  if (window.__vcEmit) window.__vcEmit({ kind: "train", msg: "开始训练 上传 " + refBlob.size + " 字节" });
   let r = null;
   for (let i = 0; i < 4 && !r; i++) { try { r = await jfetch("/api/voice/train", { method: "POST", body: fd }, 60000); } catch (e) { await sleep(800 * (i + 1)); } }
   if (!r) { toast("无法连接服务器,请稍后再点开始训练", 5000); $("train").disabled = false; return; }
@@ -352,6 +406,7 @@ async function pollJob() {
   try {
     const j = await (await jfetch("/api/voice/job", {}, 8000)).json();
     if (j.state === "idle") return;
+    if (window.__vcEmit && pollJob.last !== j.state + "|" + j.stage) { pollJob.last = j.state + "|" + j.stage; window.__vcEmit({ kind: "train", msg: "训练 " + j.state + " · " + (j.stage || "") + " · " + (j.progress || 0) + "%" }); }
     $("pall").style.width = (j.progress || 0) + "%";
     $("gl").innerHTML = (j.gpus || []).map((g) => `<b style="color:#cfd6ff">GPU${g.gpu}</b><div class="prog"><i style="width:${g.progress}%"></i></div><span class="m">${g.msg}</span>`).join("")
       + `<span class="m" style="color:#cfd6ff">${j.stage || ""}</span>`;
