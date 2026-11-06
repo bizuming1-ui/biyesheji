@@ -42,13 +42,24 @@
 * TTS 采样温度 0.75 / top_k 40(可用环境变量 `TTS_TEMPERATURE` 等调整:更低 = 更稳更像,更高 = 情绪起伏更大);
 * 跨块连续高通、整句固定增益、句末才淡出(保留)。
 
+## v4 改动(训练「点了没反应」/ 检测日志)
+
+* **训练立即起步**:旧版点击「开始训练」后会等「两张 TTS + Whisper + 相似度」全部加载完(首次运行下载模型时可能十几分钟,界面像没反应)。
+  现在只要 1 张卡的 TTS 就绪就开始;Whisper 在后台等待;另一张卡就绪后自动补上当前声音,双卡一起合成。
+  等待期间界面会实时显示每个模型的加载状态(`tts0=loading, tts1=ready …`)。点击后立刻显示「已上传…」。
+* **检测日志**(浏览器模拟器右上角):
+  * `GET /api/diag`:版本 / GPU / 进程 / 全部配置 / 训练时间线 / 声音 / 内存磁盘 / 服务端日志(环形缓冲,不影响 Kaggle 输出框);
+  * `POST /api/clientlog`:网页探针(`web/index.html` 内)上报每个 /api 请求的耗时、失败、按钮点击、JS 错误、音频状态;
+  * 模拟器侧 3 秒心跳(延迟 / P95 / 丢包)、浏览器环境、GitHub 代码同步状态;可复制 / 下载 / 一键上传到 `logs/`。
+* 自检:`CLONE_MOCK=1 python tests/e2e_diag.py`
+
 ## 文件
 
 ```
 server/        后端 (FastAPI + 多进程 GPU worker)
 web/index.html 前端(单屏,无需滚动)
 kaggle/run.py  Kaggle 启动器(装依赖/下载模型/起服务/建公网隧道/看门狗)
-tests/         Mock 端到端自检 (CLONE_MOCK=1, 不需要 GPU)
+tests/         Mock 端到端自检 (CLONE_MOCK=1, 不需要 GPU):e2e_mock / e2e_fail / e2e_diag
 kaggle_all_in_one.py  粘贴到 Kaggle 单元格即可运行的完整脚本(内置以上全部文件)
 ```
 
