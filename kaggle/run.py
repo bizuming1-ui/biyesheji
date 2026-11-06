@@ -15,7 +15,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 PORT = int(os.environ.get("PORT", "7860"))
-MARK = Path("/tmp/.clone_deps_ok_v4")
+MARK = Path("/tmp/.clone_deps_ok_v5")
 
 
 def log(*a):
@@ -187,7 +187,7 @@ def kill_stale():
 def start_server():
     env = dict(os.environ, PYTHONUNBUFFERED="1", PORT=str(PORT))
     p = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "server.app:app", "--host", "0.0.0.0", "--port", str(PORT), "--ws-ping-interval", "30", "--ws-ping-timeout", "120"],
+        [sys.executable, "-m", "uvicorn", "server.app:app", "--host", "0.0.0.0", "--port", str(PORT), "--no-access-log", "--timeout-keep-alive", "75", "--ws-ping-interval", "20", "--ws-ping-timeout", "120"],
         cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
     threading.Thread(target=pump, args=(p, "[server] "), daemon=True).start()
@@ -201,6 +201,9 @@ def start_server():
     raise RuntimeError("服务启动超时")
 
 
+_CF = {"proc": None}
+
+
 def start_cloudflared():
     exe = Path("/tmp/cloudflared")
     if not exe.exists():
@@ -208,24 +211,67 @@ def start_cloudflared():
         log("下载 cloudflared …")
         urllib.request.urlretrieve(url, exe)
         exe.chmod(0o755)
+    for attempt in range(3):
+        old = _CF.get("proc")
+        if old and old.poll() is None:
+            old.kill()
+        # --protocol http2: Kaggle 对 QUIC(UDP) 不稳定,http2(TCP) 更稳;--edge-ip-version 4 避免 IPv6 黑洞
+        p = subprocess.Popen(
+            [str(exe), "tunnel", "--url", "http://127.0.0.1:%d" % PORT, "--no-autoupdate",
+             "--protocol", "http2", "--edge-ip-version", "4", "--retries", "8"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        _CF["proc"] = p
+        found = {}
+
+        def rd(p=p, found=found):
+            for line in iter(p.stdout.readline, ""):
+                m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
+                if m and "url" not in found:
+                    found["url"] = m.group(0)
+
+        threading.Thread(target=rd, daemon=True).start()
+        for _ in range(45):
+            if "url" in found:
+                return found["url"]
+            if p.poll() is not None:
+                break
+            time.sleep(1)
+        log("cloudflared 第 %d 次没拿到网址,重试 …" % (attempt + 1))
+    return None
+
+
+def start_localhost_run():
+    """第三备选:localhost.run(只需 ssh,无需账号)。"""
+    if not shutil.which("ssh"):
+        return None
     p = subprocess.Popen(
-        [str(exe), "tunnel", "--url", "http://127.0.0.1:%d" % PORT, "--no-autoupdate"],
+        ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ServerAliveInterval=20",
+         "-R", "80:127.0.0.1:%d" % PORT, "nokey@localhost.run"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
     found = {}
 
     def rd():
         for line in iter(p.stdout.readline, ""):
-            m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
+            m = re.search(r"https://[a-z0-9]+\.lhr\.life", line)
             if m and "url" not in found:
                 found["url"] = m.group(0)
 
     threading.Thread(target=rd, daemon=True).start()
-    for _ in range(60):
+    for _ in range(30):
         if "url" in found:
             return found["url"]
         time.sleep(1)
     return None
+
+
+def tunnel_ok(url, timeout=12):
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/api/health", timeout=timeout) as r:
+            return r.status == 200
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def start_ngrok():
@@ -253,6 +299,18 @@ def banner(url):
         pass
 
 
+def open_tunnel():
+    for fn in (start_cloudflared, start_ngrok, start_localhost_run):
+        try:
+            url = fn()
+        except Exception as e:  # noqa: BLE001
+            log("隧道失败", fn.__name__, e)
+            url = None
+        if url:
+            return url
+    return None
+
+
 def main():
     log("工作目录:", ROOT)
     load_secrets()
@@ -262,20 +320,35 @@ def main():
         install_deps()
         predownload()
     server = start_server()
-    url = None
-    for fn in (start_cloudflared, start_ngrok):
-        try:
-            url = fn()
-        except Exception as e:  # noqa: BLE001
-            log("隧道失败", fn.__name__, e)
-        if url:
-            break
+    url = open_tunnel()
     if url:
         banner(url)
     else:
         log("⚠ 未能建立公网隧道。可在 Kaggle Secrets 添加 NGROK_TOKEN 后重试。")
+    # ---- 看门狗:服务进程/公网隧道任何一个挂了都自动拉起,保证「一直连得上」 ----
+    bad = 0
     try:
-        server.wait()
+        while True:
+            time.sleep(20)
+            if server.poll() is not None:
+                log("⚠ 服务进程退出(code=%s),正在重启 …" % server.returncode)
+                server = start_server()
+                bad = 0
+                continue
+            if not url:
+                continue
+            if tunnel_ok(url):
+                bad = 0
+                continue
+            bad += 1
+            log("⚠ 公网隧道检测失败 (%d/3)" % bad)
+            if bad >= 3:
+                log("重建公网隧道 …(网址会变化,请使用下面的新网址)")
+                new = open_tunnel()
+                if new:
+                    url = new
+                    banner(url)
+                bad = 0
     except KeyboardInterrupt:
         server.terminate()
 
