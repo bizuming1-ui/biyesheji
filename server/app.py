@@ -1,4 +1,11 @@
-"""FastAPI 入口。  启动: python -m uvicorn server.app:app --host 0.0.0.0 --port 7860"""
+"""FastAPI 入口。  启动: python -m uvicorn server.app:app --host 0.0.0.0 --port 7860
+
+稳定性设计(v3):
+  * 对话不再依赖 WebSocket。隧道/代理悄悄丢掉 WebSocket 时,旧版会「发了没反应」。
+    现在是 HTTP: POST /api/chat 创建一轮对话(服务端独立生成,与连接无关),
+    GET /api/events?after=N 长轮询取事件(文本/音频/状态)。网络断了就用同一个游标重试,数据一个不丢。
+  * 保留 /ws 作为可选通道(不再被前端使用)。
+"""
 import asyncio
 import json
 from pathlib import Path
@@ -29,9 +36,9 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 @app.middleware("http")
 async def allow_embed(request: Request, call_next):
     resp = await call_next(request)
-    # 允许被「浏览器模拟器」iframe 嵌入,并允许麦克风/自动播放(已移除摄像头)
+    # 允许被「浏览器模拟器」iframe 嵌入,并允许麦克风/自动播放/摄像头
     resp.headers["Content-Security-Policy"] = "frame-ancestors *"
-    resp.headers["Permissions-Policy"] = "microphone=*, autoplay=*"
+    resp.headers["Permissions-Policy"] = "microphone=*, autoplay=*, camera=*"
     resp.headers["Cache-Control"] = "no-store"
     if "x-frame-options" in resp.headers:
         del resp.headers["x-frame-options"]
@@ -46,6 +53,11 @@ async def index():
 @app.get("/api/health")
 async def health():
     return {"ok": True, "mock": config.MOCK}
+
+
+@app.get("/api/ping")
+async def ping():
+    return {"t": __import__("time").time()}
 
 
 @app.get("/api/status")
@@ -66,12 +78,12 @@ async def favicon():
 
 
 @app.post("/api/voice/train")
-async def train(file: UploadFile = File(...), text: str = Form("")):
+async def train(file: UploadFile = File(...), text: str = Form(""), lang: str = Form("zh")):
     data = await file.read()
     if len(data) < 2000:
         raise HTTPException(400, "音频文件为空或太小")
     try:
-        await engine.start_training(data, text)
+        await engine.start_training(data, text, lang)
     except RuntimeError as e:
         raise HTTPException(409, str(e))
     return {"ok": True}
@@ -97,9 +109,41 @@ async def asr(request: Request):
     try:
         return await engine.transcribe(data)
     except Exception as e:  # noqa: BLE001
-        return JSONResponse({"error": str(e).strip().splitlines()[-1]}, status_code=500)
+        return JSONResponse({"error": (str(e).strip().splitlines() or ["未知错误"])[-1]}, status_code=500)
 
 
+# ---------------------------------------------------------------- 与连接无关的对话接口
+@app.post("/api/chat")
+async def chat(request: Request):
+    body = await request.json()
+    sid = str(body.get("sid") or "anon")[:64]
+    text = str(body.get("text", "")).strip()
+    if not text:
+        raise HTTPException(400, "空消息")
+    tid = await engine.start_chat(sid, text, dict(body.get("opts") or {}), bool(body.get("speak")))
+    return {"ok": True, "tid": tid}
+
+
+@app.get("/api/events")
+async def events(sid: str, tid: int, after: int = 0, wait: float = 15.0):
+    return await engine.poll_events(sid[:64], tid, max(0, after), wait)
+
+
+@app.post("/api/stop")
+async def stop(request: Request):
+    body = await request.json()
+    engine.stop_chat(str(body.get("sid") or "anon")[:64])
+    return {"ok": True}
+
+
+@app.post("/api/reset")
+async def reset(request: Request):
+    body = await request.json()
+    engine.reset_chat(str(body.get("sid") or "anon")[:64])
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- 可选 WebSocket(兼容旧客户端)
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
@@ -119,7 +163,7 @@ async def ws_endpoint(ws: WebSocket):
             await coro
         except asyncio.CancelledError:
             pass
-        except Exception as e:  # noqa: BLE001  任何意外都要让界面看到,绝不静默
+        except Exception as e:  # noqa: BLE001
             try:
                 await send_json({"type": "error", "text": "服务端异常: " + (str(e).strip().splitlines() or [repr(e)])[-1]})
             except Exception:  # noqa: BLE001
