@@ -1,6 +1,7 @@
 """FastAPI 入口。  启动: python -m uvicorn server.app:app --host 0.0.0.0 --port 7860"""
 import asyncio
 import json
+from pathlib import Path
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
@@ -28,9 +29,9 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 @app.middleware("http")
 async def allow_embed(request: Request, call_next):
     resp = await call_next(request)
-    # 允许被「浏览器模拟器」iframe 嵌入,并允许摄像头/麦克风/自动播放
+    # 允许被「浏览器模拟器」iframe 嵌入,并允许麦克风/自动播放(已移除摄像头)
     resp.headers["Content-Security-Policy"] = "frame-ancestors *"
-    resp.headers["Permissions-Policy"] = "camera=*, microphone=*, autoplay=*"
+    resp.headers["Permissions-Policy"] = "microphone=*, autoplay=*"
     resp.headers["Cache-Control"] = "no-store"
     if "x-frame-options" in resp.headers:
         del resp.headers["x-frame-options"]
@@ -71,7 +72,8 @@ async def job():
 
 @app.get("/api/voice/ref.wav")
 async def ref_wav():
-    p = config.VOICE_DIR / "current" / "ref.wav"
+    v = engine.voice
+    p = Path(v["ref_path"]) if v and v.get("ref_path") else config.VOICE_DIR / "current" / "ref.wav"
     if not p.exists():
         raise HTTPException(404, "尚无参考音频")
     return FileResponse(p, media_type="audio/wav")
@@ -82,15 +84,6 @@ async def asr(request: Request):
     data = await request.body()
     try:
         return await engine.transcribe(data)
-    except Exception as e:  # noqa: BLE001
-        return JSONResponse({"error": str(e).strip().splitlines()[-1]}, status_code=500)
-
-
-@app.post("/api/detect")
-async def detect(request: Request, labels: str = "", thr: float = 0.15):
-    data = await request.body()
-    try:
-        return await engine.detect(data, [s for s in labels.split(",") if s.strip()], thr)
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"error": str(e).strip().splitlines()[-1]}, status_code=500)
 
@@ -114,8 +107,11 @@ async def ws_endpoint(ws: WebSocket):
             await coro
         except asyncio.CancelledError:
             pass
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001  任何意外都要让界面看到,绝不静默
+            try:
+                await send_json({"type": "error", "text": "服务端异常: " + (str(e).strip().splitlines() or [repr(e)])[-1]})
+            except Exception:  # noqa: BLE001
+                pass
 
     try:
         while True:
