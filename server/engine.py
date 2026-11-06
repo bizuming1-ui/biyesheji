@@ -290,7 +290,8 @@ class Engine:
         if not v:
             return
         try:
-            await w.call("prepare", voice_id=v["id"], ref_path=v["ref_path"], ref_text=v.get("ref_text", ""))
+            await w.call("prepare", _timeout=300, voice_id=v["id"], ref_path=v["ref_path"], ref_text=v.get("ref_text", ""),
+                         modes=[v["mode"]] if v.get("mode") else None)
             if w.name not in v.setdefault("workers", []):
                 v["workers"].append(w.name)
             print("[engine] %s 已补齐当前声音" % w.name, flush=True)
@@ -324,20 +325,33 @@ class Engine:
             await asyncio.sleep(0.5)
 
     async def _ensure_ready(self):
-        """训练前:失败的模型自动重试一次;至少 1 张卡的 TTS 就绪即可开始(另一张卡就绪后自动参与)。"""
+        """训练前:失败的模型自动重试一次;**只要有 1 张卡的 TTS 就绪就立刻开始训练**。
+        旧版会等「两张 TTS + Whisper + 相似度」全部加载完,首次运行要等十几分钟,界面像「点了没反应」。
+        现在: 另一张卡/Whisper 还在加载时不等待,它们就绪后自动参与(见 _prep_late / _train 里的 aux_task)。"""
         failed = [w for w in [*self.tts, self.aux] if w and w.state == "error"]
         for w in failed:
             self._log("重新加载 %s …" % w.name)
             if not w.proc.is_alive():
                 w.respawn()
             asyncio.create_task(self._load(w))
-        await self._wait_loaded([*self.tts, self.aux])
+        t0 = time.time()
+        last = 0.0
+        while not self.ready_tts():
+            if self.tts and all(w.state == "error" for w in self.tts):
+                break
+            if time.time() - t0 > 1200:
+                raise TimeoutError("模型加载超时(>20 分钟),请查看 Kaggle 输出日志")
+            if time.time() - last >= 2.0:
+                last = time.time()
+                st = ", ".join("%s=%s" % (w.name, w.state) for w in [*self.tts, self.aux] if w)
+                self._set(stage="等待 TTS 模型加载 %ds (%s)" % (time.time() - t0, st))
+            await asyncio.sleep(0.4)
         ws = self.ready_tts()
         if not ws:
             raise RuntimeError("TTS 模型加载失败 — " + (self.error_summary(self.tts) or "未知原因,请查看 Kaggle 输出日志"))
         bad = [w.name for w in self.tts if w.state != "ready"]
         if bad:
-            self._log("⚠ %s 未就绪,本次只用其余的卡训练" % ",".join(bad))
+            self._log("ℹ %s 仍在加载/不可用,先用已就绪的卡训练,其余就绪后自动加入" % ",".join(bad))
         return ws
 
     async def _wait_ready(self, ws, timeout=900):
@@ -401,6 +415,10 @@ class Engine:
         print("[train] " + msg, flush=True)
 
     def _set(self, **kw):
+        if kw.get("stage") and kw.get("stage") != self.job.get("stage"):
+            tl = self.job.setdefault("timeline", [])
+            tl.append([round(time.time() - self.job.get("started", time.time()), 1), kw["stage"][:80]])
+            del tl[:-30]
         self.job.update(kw)
 
     async def start_training(self, audio: bytes, ref_text: str, lang: str = "zh"):
@@ -422,10 +440,10 @@ class Engine:
             avg = sum(g["progress"] for g in gs) / len(gs)
             self.job["progress"] = max(self.job.get("progress", 0), int(15 + 0.8 * avg))
 
-    async def _get_ref_text(self, ref, ref_text, aux_ok, lang):
+    async def _get_ref_text(self, ref, ref_text, aux_task, lang):
         if ref_text:
             return ref_text
-        if not aux_ok:
+        if not await aux_task:
             self._log("⚠ 语音识别模型未就绪,本次只用 x-vector 模式(不需要文本)")
             return ""
         self._set(stage="自动识别参考语音文本 (Whisper @ GPU%d)" % self.aux.gpu)
@@ -445,9 +463,19 @@ class Engine:
         try:
             self._set(stage="等待模型加载", progress=3)
             tts_ws = await self._ensure_ready()
-            aux_ok = self.aux is not None and self.aux.state == "ready"
-            if not aux_ok:
-                self._log("⚠ Whisper/相似度模型未就绪:" + (self.error_summary([self.aux]) or "?"))
+
+            async def _aux_wait():  # Whisper/相似度模型:后台等它,绝不阻塞训练起步
+                if self.aux is None:
+                    return False
+                try:
+                    await self._wait_loaded([self.aux], timeout=300)
+                except Exception:  # noqa: BLE001
+                    return False
+                if self.aux.state != "ready":
+                    self._log("⚠ Whisper/相似度模型未就绪:" + (self.error_summary([self.aux]) or "?"))
+                return self.aux.state == "ready"
+
+            aux_task = asyncio.create_task(_aux_wait())
             # 1. 参考音频清洗
             self._set(stage="参考音频清洗(解码/降噪/切静音/归一化)", progress=8)
             x = await asyncio.to_thread(au.decode_audio, audio, config.SR)
@@ -477,7 +505,7 @@ class Engine:
                 self._gpu_msg(self.tts.index(w_), 5, "等待")
             w0 = tts_ws[0]
             w1 = tts_ws[1] if len(tts_ws) > 1 else tts_ws[0]
-            text_task = asyncio.create_task(self._get_ref_text(ref, ref_text, aux_ok, "zh" if zh else "en"))
+            text_task = asyncio.create_task(self._get_ref_text(ref, ref_text, aux_task, "zh" if zh else "en"))
             prepared: dict[str, set] = {}
             scores: dict[str, float] = {}
 
@@ -489,6 +517,7 @@ class Engine:
                 self._gpu_msg(i, 50, "合成校验句(%s)" % mode)
                 wav, sr = await self.synth_collect(w, vid, test, lang, mode)
                 wav = await asyncio.to_thread(au.postprocess_chunk, wav, sr, ref_db, True, 0.0)
+                aux_ok = await aux_task
                 if not aux_ok:
                     self._gpu_msg(i, 90, "%s 就绪" % mode)
                     return mode, None
@@ -552,6 +581,9 @@ class Engine:
             self._set(state="done", stage="训练完成", progress=100, similarity=sim, mode=best, ref_text=text,
                       elapsed=round(time.time() - self.job.get("started", time.time()), 1))
             self._log("完成(%.1fs),选用模式 %s,相似度 %s" % (self.job["elapsed"], best, "%.2f%%" % (sim * 100) if sim is not None else "N/A"))
+            for w_ in self.ready_tts():  # 训练期间才加载完的卡:后台补上当前声音,双卡一起干活
+                if w_.name not in names:
+                    asyncio.create_task(self._prep_late(w_))
             asyncio.create_task(self._make_fillers())  # 语气词缓存放后台,训练完立刻可用
         except Exception as e:  # noqa: BLE001
             msg = str(e).strip().splitlines()[-1] if str(e).strip() else repr(e)
