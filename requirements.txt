@@ -1,4 +1,4 @@
-qwen-tts
+faster-qwen3-tts
 fastapi
 uvicorn[standard]
 python-multipart
@@ -6,5 +6,4 @@ soundfile
 scipy
 noisereduce
 accelerate
-pillow
 huggingface_hub
