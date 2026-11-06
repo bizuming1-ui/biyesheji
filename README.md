@@ -8,7 +8,7 @@
 | --- | --- | --- |
 | `tts0` | GPU0 | Qwen3-TTS-12Hz-1.7B-Base 声音克隆(faster-qwen3-tts: CUDA Graph + 流式输出) |
 | `tts1` | GPU1 | Qwen3-TTS-12Hz-1.7B-Base 声音克隆(同上) |
-| `llm`  | GPU0 | Qwen3-4B-Instruct-2507 流式长文本对话(支持 256K 上下文,长文模式 4096 token) |
+| `llm`  | GPU0+GPU1 | Qwen3-4B-Instruct-2507 按层均分到两张卡(每卡约 3.8GiB),流式长文本对话(长文模式 4096 token) |
 | `aux`  | GPU1 | Whisper(语音识别) + WavLM(说话人相似度) |
 
 每个进程用 `CUDA_VISIBLE_DEVICES` 独占一张卡,互不抢 GIL,双卡真并行。服务进程不退出,模型就一直常驻显存。
@@ -49,3 +49,11 @@ CLONE_MOCK=1 python tests/e2e_mock.py
 - T4 单卡合成速度约为实时的 0.9 倍;系统用「双卡交替合成 + 自适应缓冲」保证播放不断流,但**不是**数学意义上的绝对保证。
 - “相似度”显示的是 WavLM 说话人嵌入余弦相似度,是真实测量值;99.5% 在该度量下不是一个可保证的数值,系统通过「择优模式 + 高质量参考音频」尽量提高它。参考音频越干净(安静环境、8~20 秒、情绪自然)越像。
 - Kaggle 会话有时长上限(约 12 小时/长时间无操作会断开),会话结束后模型随之卸载,重新运行单元格即可。
+
+## 故障排查(v2 修复记录)
+
+- `property 'upsample' of 'Qwen3TTSTokenizerV2Encoder' object has no setter` / `MimiEncoderConfig has no attribute rope_theta`
+  → 官方 `qwen-tts` 与 transformers 5.x 不兼容。正确组合:`faster-qwen3-tts` + `qwen-tts-hf` + `transformers==5.15.1`(不要同时装 `qwen-tts`)。`kaggle/run.py` 会自动卸载冲突包并做一次真实的编码器构造自检。
+- `CUDA out of memory`(GPU0)→ 以前 LLM(7.6GiB)+TTS 同在 GPU0 且失败回退又重复加载一次。现在 LLM 均分两卡、加载失败先释放显存再回退,并自动重试 2 次。
+- 「发了没反应」→ 前端消息先上屏;WebSocket 8 秒心跳 + 30 秒无 pong 自动重连;断线期间发送的消息连上后自动补发;状态接口不再被 nvidia-smi 卡住事件循环。
+- 界面顶部出现红条 = 某个模型加载失败,会显示真实原因,点「重新加载模型」即可重试,无需重启单元格。
