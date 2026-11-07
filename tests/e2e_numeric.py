@@ -34,7 +34,7 @@ def ref():
 
 def scenario(name, port, start_dtype, bad_dtypes, expect_state, expect_dtype=None):
     print("\n=== 场景: %s ===" % name)
-    env = dict(os.environ, CLONE_MOCK="1", PORT=str(port), TTS_DTYPE=start_dtype, MOCK_NUMERIC_DTYPE=bad_dtypes,
+    env = dict(os.environ, CLONE_MOCK="1", LLM_BACKEND="local", PORT=str(port), TTS_DTYPE=start_dtype, MOCK_NUMERIC_DTYPE=bad_dtypes,
                CLONE_DATA="/tmp/clone_numeric_%d" % port, PYTHONUNBUFFERED="1")
     p = subprocess.Popen([sys.executable, "-m", "uvicorn", "server.app:app", "--port", str(port), "--no-access-log"],
                          cwd=ROOT, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
