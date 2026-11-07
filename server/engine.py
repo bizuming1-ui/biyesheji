@@ -14,7 +14,7 @@ import uuid
 import numpy as np
 
 from . import audio_utils as au
-from . import config
+from . import config, perf
 from .errors import NumericError, is_numeric_error, next_dtype
 from .text_chunker import SentenceChunker, clean_for_tts, detect_language, is_speakable
 
@@ -244,6 +244,7 @@ class Engine:
         self.gpu_count = 0
         self.rng = np.random.default_rng()
         self.turn_stats: dict = {}
+        self.last_train_uid = None
         self.fillers: list[dict] = []
         self._last_filler = -1
         self.sessions: dict[str, Session] = {}
@@ -463,7 +464,10 @@ class Engine:
     def _set(self, **kw):
         if kw.get("stage") and kw.get("stage") != self.job.get("stage"):
             tl = self.job.setdefault("timeline", [])
-            tl.append([round(time.time() - self.job.get("started", time.time()), 1), kw["stage"][:80]])
+            now_off = round(time.time() - self.job.get("started", time.time()), 1)
+            if tl:  # 上一个阶段结束 → 记录它的耗时(「运行日志」按它找瓶颈)
+                perf.record("train/" + tl[-1][1][:40], max(0.0, now_off - tl[-1][0]))
+            tl.append([now_off, kw["stage"][:80]])
             del tl[:-30]
         self.job.update(kw)
 
@@ -501,7 +505,8 @@ class Engine:
             return ""
         self._set(stage="自动识别参考语音文本 (Whisper @ GPU%d)" % self.aux.gpu)
         try:
-            r = await self.aux.call("asr", _timeout=120, samples=au.resample(ref, config.SR, 16000), lang=lang)
+            with perf.span("aux/whisper_asr"):
+                r = await self.aux.call("asr", _timeout=120, samples=au.resample(ref, config.SR, 16000), lang=lang)
             self._log("识别文本: %s" % r["text"])
             return r["text"]
         except Exception as e:  # noqa: BLE001
@@ -562,10 +567,12 @@ class Engine:
         aux_task = asyncio.create_task(_aux_wait())
         # 1. 参考音频清洗
         self._set(stage="参考音频清洗(解码/降噪/切静音/归一化)", progress=8)
-        x = await asyncio.to_thread(au.decode_audio, audio, config.SR)
+        with perf.span("cpu/decode_audio"):
+            x = await asyncio.to_thread(au.decode_audio, audio, config.SR)
         if x.size < config.SR * 1.5:
             raise ValueError("参考音频太短(<1.5s),请至少录制 5 秒以上")
-        ref, quality, warns = await asyncio.to_thread(au.preprocess_reference, x, config.SR)
+        with perf.span("cpu/preprocess_reference"):
+            ref, quality, warns = await asyncio.to_thread(au.preprocess_reference, x, config.SR)
         self._set(quality=quality, warnings=warns)
         self._log("参考音频 %.1fs, 信噪比≈%.0fdB" % (quality["duration"], quality.get("snr_db_raw", 0)))
         vid = uuid.uuid4().hex[:8]
@@ -596,10 +603,12 @@ class Engine:
         async def eval_mode(w, mode, text):
             i = self.tts.index(w)
             self._gpu_msg(i, 15, "提取声纹(%s)" % mode)
-            await w.call("prepare", _timeout=300, voice_id=vid, ref_path=str(ref_path), ref_text=text, modes=[mode], warm=False)
+            with perf.span("gpu%d/prepare_%s" % (w.gpu, mode)):
+                await w.call("prepare", _timeout=300, voice_id=vid, ref_path=str(ref_path), ref_text=text, modes=[mode], warm=False)
             prepared.setdefault(w.name, set()).add(mode)
             self._gpu_msg(i, 50, "合成校验句(%s)" % mode)
-            wav, sr = await self.synth_collect(w, vid, test, lang, mode, chunk=config.TRAIN_CHUNK, stall=config.TRAIN_SYNTH_STALL)
+            with perf.span("gpu%d/synth_%s" % (w.gpu, mode)):
+                wav, sr = await self.synth_collect(w, vid, test, lang, mode, chunk=config.TRAIN_CHUNK, stall=config.TRAIN_SYNTH_STALL)
             wav = await asyncio.to_thread(au.postprocess_chunk, wav, sr, ref_db, True, 0.0)
             try:  # 合成完最多再等 Whisper/相似度模型 TRAIN_AUX_WAIT 秒,不再无限等(慢的话只用 x-vector/ICL 默认择优)
                 aux_ok = await asyncio.wait_for(asyncio.shield(aux_task), config.TRAIN_AUX_WAIT)
@@ -609,7 +618,8 @@ class Engine:
             if not aux_ok:
                 self._gpu_msg(i, 90, "%s 就绪" % mode)
                 return mode, None
-            s_ = await self.aux.call("sim", _timeout=120, a=ref16, b=au.resample(wav, sr, 16000))
+            with perf.span("aux/similarity_%s" % mode):
+                s_ = await self.aux.call("sim", _timeout=120, a=ref16, b=au.resample(wav, sr, 16000))
             self._gpu_msg(i, 90, "%s 相似度 %.1f%%" % (mode, s_["cosine"] * 100))
             return mode, s_["cosine"]
 
@@ -671,6 +681,7 @@ class Engine:
         self.fillers = []
         self._set(state="done", stage="训练完成", progress=100, similarity=sim, mode=best, ref_text=text,
                   elapsed=round(time.time() - self.job.get("started", time.time()), 1))
+        perf.record("train/TOTAL", self.job["elapsed"])
         self._log("完成(%.1fs),选用模式 %s,相似度 %s" % (self.job["elapsed"], best, "%.2f%%" % (sim * 100) if sim is not None else "N/A"))
         for w_ in self.ready_tts():  # 训练期间才加载完的卡:后台补上当前声音,双卡一起干活
             if w_.name not in names:
@@ -982,6 +993,11 @@ class Engine:
             stats["total_ms"] = round((time.time() - t0) * 1000)
             stats["audio_s"] = round(stats["audio_s"], 2)
             self.turn_stats = stats
+            if stats.get("ttfa_ms"):
+                perf.record("chat/first_audio", stats["ttfa_ms"] / 1000.0)
+            if stats.get("llm_first_ms"):
+                perf.record("chat/llm_first_token", stats["llm_first_ms"] / 1000.0)
+            perf.record("chat/turn_total", stats["total_ms"] / 1000.0)
             await emit_json({"type": "done", "turn": turn, "stats": stats})
         except asyncio.CancelledError:
             abort()
