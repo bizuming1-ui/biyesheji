@@ -155,7 +155,7 @@ def predownload():
 
     from server import config
 
-    repos = [config.TTS_MODEL, config.ASR_MODEL, config.SV_MODEL] + ([] if config.USE_DEEPSEEK else [config.LLM_MODEL])  # v7: 对话走 DeepSeek API,不再下载本地 LLM(省 ~8GB)
+    repos = [config.TTS_MODEL, config.ASR_MODEL, config.SV_MODEL] + [config.LLM_MODEL]  # v9: 对话大模型直接部署在 Kaggle(约 8GB)
 
     def dl(r):
         t = time.time()
