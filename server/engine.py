@@ -15,6 +15,7 @@ import numpy as np
 
 from . import audio_utils as au
 from . import config, perf
+from . import deepseek as ds
 from .errors import NumericError, is_numeric_error, next_dtype
 from .text_chunker import SentenceChunker, clean_for_tts, detect_language, is_speakable
 
@@ -248,6 +249,55 @@ class Engine:
         self.fillers: list[dict] = []
         self._last_filler = -1
         self.sessions: dict[str, Session] = {}
+        # v7: 对话大模型改为 DeepSeek API。Key 只在内存里,绝不写盘/写日志/出现在任何接口响应里
+        self.ds: dict = {"key": "", "model": "", "thinking": False, "state": "nokey", "error": "", "models": [], "latency_ms": None}
+        self.speech_rate = {"Chinese": 0.20, "English": 0.075, "Japanese": 0.18, "Korean": 0.17}  # 秒/字符,训练后按真实合成结果自适应
+
+    # ---------- DeepSeek ----------
+    def ds_public(self) -> dict:
+        d = self.ds
+        key = d["key"]
+        return {
+            "state": d["state"], "error": d["error"], "model": d["model"] or ds.DEFAULT_MODEL, "thinking": d["thinking"],
+            "models": d["models"], "latency_ms": d["latency_ms"], "has_key": bool(key),
+            "key_hint": ("…" + key[-4:]) if len(key) >= 8 else "",
+        }
+
+    async def ds_configure(self, key: str, model: str = "", thinking: bool = False) -> dict:
+        key = (key or "").strip()
+        self.ds["thinking"] = bool(thinking)
+        try:
+            info = await ds.client.check(key)
+        except ds.DeepSeekError as e:
+            self.ds.update(state="error", error=str(e))
+            raise
+        self.ds["key"] = key
+        models = info["models"]
+        chosen = model if (model and (not models or model in models)) else info["best"]
+        self.ds.update(state="ok", error="", model=chosen, models=models, latency_ms=info["latency_ms"])
+        return self.ds_public()
+
+    def ds_resolve(self, opts: dict) -> dict:
+        d = dict(opts.get("ds") or {})
+        key = str(d.get("key") or "").strip()
+        if key and key != self.ds["key"]:
+            self.ds["key"] = key
+            self.ds["state"] = "ok"
+        return {
+            "key": key or self.ds["key"],
+            "model": str(d.get("model") or self.ds["model"] or ds.DEFAULT_MODEL),
+            "thinking": bool(d.get("thinking", self.ds["thinking"])),
+        }
+
+    def est_audio_s(self, text: str) -> float:
+        return len(text) * self.speech_rate.get(detect_language(text), 0.2)
+
+    def learn_rate(self, text: str, dur: float):
+        if len(text) < 6 or dur <= 0.3:
+            return
+        lang = detect_language(text)
+        old = self.speech_rate.get(lang, 0.2)
+        self.speech_rate[lang] = round(0.7 * old + 0.3 * (dur / len(text)), 4)
 
     # ---------- 启动 ----------
     async def start(self):
@@ -260,7 +310,8 @@ class Engine:
         for i, g in enumerate(tts_gpus):
             self.tts.append(Worker("tts%d" % i, "tts", g, self.loop))
         # 对话模型按层均分到两张卡("0,1"),避免 GPU0 同时放 TTS+整个 LLM 而 OOM
-        self.llm = Worker("llm", "llm", "0,1" if (n >= 2 and config.LLM_SPLIT) else 0, self.loop)
+        if not config.USE_DEEPSEEK:  # v7: 默认不再加载本地 LLM(省下约 7.5GiB 显存和几分钟加载时间)
+            self.llm = Worker("llm", "llm", "0,1" if (n >= 2 and config.LLM_SPLIT) else 0, self.loop)
         self.aux = Worker("aux", "aux", 1 if n >= 2 else 0, self.loop)
         for w in self.workers:
             w.start()
@@ -426,7 +477,9 @@ class Engine:
             "job": self.job,
             "turn": self.turn_stats,
             "fillers": len(self.fillers),
-            "models": {"tts": config.TTS_MODEL, "llm": config.LLM_MODEL, "asr": config.ASR_MODEL},
+            "models": {"tts": config.TTS_MODEL, "llm": ("DeepSeek · " + (self.ds["model"] or ds.DEFAULT_MODEL)) if config.USE_DEEPSEEK else config.LLM_MODEL, "asr": config.ASR_MODEL},
+            "deepseek": self.ds_public(),
+            "code_version": config.CODE_VERSION,
         }
 
     def voice_public(self):
@@ -756,18 +809,21 @@ class Engine:
             await out.put({"error": str(e)})
             await out.put(None)
             return
-        post, t0 = None, time.time()
+        post, t0, got_s = None, time.time(), 0.0
         try:
             async for d in w.stream(rid, q, stall=60):
                 if post is None:
                     post = au.StreamPost(d["sr"], v.get("target_rms_db"), trim_head=True)
                 pcm = post.feed(d["pcm"])
                 if pcm.size:
+                    got_s += pcm.size / d["sr"]
                     await out.put({"pcm": au.to_pcm16(pcm), "sr": d["sr"], "dur": pcm.size / d["sr"], "gpu": w.gpu})
             if post is not None:
                 tail = post.finish()
                 if tail.size:
+                    got_s += tail.size / post.sr
                     await out.put({"pcm": au.to_pcm16(tail), "sr": post.sr, "dur": tail.size / post.sr, "gpu": w.gpu})
+                self.learn_rate(text, got_s)
         except asyncio.CancelledError:
             w.cancel.value = max(w.cancel.value, rid)
             raise
@@ -876,7 +932,7 @@ class Engine:
         breath = float(opts.get("breath", 0.4))
         long_mode = bool(opts.get("long", False))
         has_voice = self.voice is not None and bool([w for w in self.ready_tts() if w.name in self.voice.get("workers", [w.name])])
-        use_filler = bool(opts.get("filler", True)) and not speak_only
+        use_filler = bool(opts.get("filler", False)) and not speak_only
         stats = {"turn": turn, "chunks": 0, "audio_s": 0.0, "ttfa_ms": None, "body_ttfa_ms": None, "llm_first_ms": None, "gpu_chunks": {}, "filler": None}
         filler = self.pick_filler() if (use_filler and has_voice) else None
         base_idx = 1 if filler else 0
@@ -931,6 +987,7 @@ class Engine:
             await emit_json({"type": "text", "delta": filler["text"].rstrip(",") + ",", "filler": True})
         synth_tasks: list[asyncio.Task] = []
         n_sub = 0
+        est_total = [0.0]  # 已送去合成的文本预计总时长(秒),随 plan 事件发给前端,用来算「需要预缓冲多久才不会断」
 
         def submit(piece: str):
             nonlocal n_sub
@@ -940,6 +997,7 @@ class Engine:
             if not is_speakable(cleaned):
                 return
             sq: asyncio.Queue = asyncio.Queue()
+            est_total[0] += self.est_audio_s(cleaned)
             synth_tasks.append(asyncio.create_task(self.synth_stream(cleaned, n_sub == 0, sq)))
             n_sub += 1
             order.put_nowait(sq)
@@ -954,6 +1012,7 @@ class Engine:
             if speak_only:
                 for p in _split_all(text):
                     submit(p)
+                await emit_json({"type": "plan", "est_s": round(est_total[0], 2), "final": True})
                 await emit_json({"type": "text", "delta": text})
             else:
                 sys_prompt = config.SYSTEM_PROMPT
@@ -964,28 +1023,72 @@ class Engine:
                     msgs[0]["content"] += "\n" + config.FILLER_HINT % filler["text"].rstrip(",")
                 if long_mode:
                     msgs[0]["content"] += "\n本次请尽可能详尽、完整、有层次地长篇回答。"
-                if self.llm is None or self.llm.state != "ready":
-                    detail = (self.llm.error or "") if self.llm else ""
-                    raise RuntimeError("对话模型尚未加载完成或加载失败。" + (detail.strip().splitlines()[-1] if detail.strip() else "请稍候或查看 Kaggle 输出日志"))
-                rid, q = self.llm.submit("chat", messages=msgs, max_new_tokens=max_new)
-                sess.llm_rid = rid
                 full = []
-                try:
-                    async for delta in self.llm.stream(rid, q, stall=config.LLM_FIRST_TOKEN_TIMEOUT + 30):
-                        if stats["llm_first_ms"] is None:
-                            stats["llm_first_ms"] = round((time.time() - t0) * 1000)
-                        full.append(delta)
-                        await emit_json({"type": "text", "delta": delta})
-                        for p in chunker.feed(delta):
-                            submit(p)
-                finally:
-                    if full:
-                        sess.history.append({"role": "assistant", "content": "".join(full)})
-                        sess.trim()
-                    elif sess.history and sess.history[-1]["role"] == "user":
-                        sess.history.pop()  # 没有产出内容 → 不把这条用户消息留在历史里
+                if config.USE_DEEPSEEK:
+                    dsc = self.ds_resolve(opts)
+                    thinking = dsc["thinking"]
+                    gen = ds.client.stream(dsc["key"], msgs, dsc["model"], thinking, max_new)
+                    it = gen.__aiter__()
+                    think_sent = False
+                    try:
+                        while True:
+                            limit = config.LLM_STALL_TIMEOUT if full else config.LLM_FIRST_TOKEN_TIMEOUT * (2 if thinking else 1)
+                            try:
+                                kind, piece = await asyncio.wait_for(it.__anext__(), limit)
+                            except StopAsyncIteration:
+                                break
+                            except asyncio.TimeoutError:
+                                raise RuntimeError("DeepSeek %d 秒内没有返回内容(网络或服务繁忙),请重试" % limit)
+                            if kind == "think":
+                                if not think_sent:
+                                    think_sent = True
+                                    await emit_json({"type": "think"})
+                                continue
+                            if kind == "cont":
+                                await emit_json({"type": "cont", "round": int(piece)})
+                                continue
+                            if stats["llm_first_ms"] is None:
+                                stats["llm_first_ms"] = round((time.time() - t0) * 1000)
+                            full.append(piece)
+                            await emit_json({"type": "text", "delta": piece})
+                            n_before = n_sub
+                            for p in chunker.feed(piece):
+                                submit(p)
+                            if n_sub != n_before:
+                                await emit_json({"type": "plan", "est_s": round(est_total[0], 2)})
+                    finally:
+                        try:
+                            await gen.aclose()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        if full:
+                            sess.history.append({"role": "assistant", "content": "".join(full)})
+                            sess.trim()
+                        elif sess.history and sess.history[-1]["role"] == "user":
+                            sess.history.pop()
+                else:
+                    if self.llm is None or self.llm.state != "ready":
+                        detail = (self.llm.error or "") if self.llm else ""
+                        raise RuntimeError("对话模型尚未加载完成或加载失败。" + (detail.strip().splitlines()[-1] if detail.strip() else "请稍候或查看 Kaggle 输出日志"))
+                    rid, q = self.llm.submit("chat", messages=msgs, max_new_tokens=max_new)
+                    sess.llm_rid = rid
+                    try:
+                        async for delta in self.llm.stream(rid, q, stall=config.LLM_FIRST_TOKEN_TIMEOUT + 30):
+                            if stats["llm_first_ms"] is None:
+                                stats["llm_first_ms"] = round((time.time() - t0) * 1000)
+                            full.append(delta)
+                            await emit_json({"type": "text", "delta": delta})
+                            for p in chunker.feed(delta):
+                                submit(p)
+                    finally:
+                        if full:
+                            sess.history.append({"role": "assistant", "content": "".join(full)})
+                            sess.trim()
+                        elif sess.history and sess.history[-1]["role"] == "user":
+                            sess.history.pop()
                 for p in chunker.flush():
                     submit(p)
+                await emit_json({"type": "plan", "est_s": round(est_total[0], 2), "final": True})
                 if not full:
                     raise RuntimeError("对话模型没有返回任何内容")
             order.put_nowait(None)
