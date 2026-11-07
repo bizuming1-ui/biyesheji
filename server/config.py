@@ -2,7 +2,7 @@
 import os
 from pathlib import Path
 
-CODE_VERSION = "v9"  # 浏览器模拟器的「检测日志」会读取它,用来判断 Kaggle 上跑的是不是最新代码
+CODE_VERSION = "v10"  # 浏览器模拟器的「检测日志」会读取它,用来判断 Kaggle 上跑的是不是最新代码
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("CLONE_DATA", ROOT / "data"))
