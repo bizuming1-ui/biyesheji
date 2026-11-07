@@ -2,7 +2,7 @@
 import os
 from pathlib import Path
 
-CODE_VERSION = "v6"  # 浏览器模拟器的「检测日志」会读取它,用来判断 Kaggle 上跑的是不是最新代码
+CODE_VERSION = "v7"  # 浏览器模拟器的「检测日志」会读取它,用来判断 Kaggle 上跑的是不是最新代码
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("CLONE_DATA", ROOT / "data"))
@@ -21,10 +21,11 @@ ASR_MODEL = os.environ.get("ASR_MODEL", "openai/whisper-large-v3-turbo")
 SV_MODEL = os.environ.get("SV_MODEL", "microsoft/wavlm-base-plus-sv")
 
 SR = 24000  # Qwen3-TTS 输出采样率
-LLM_DEFAULT_TOKENS = int(os.environ.get("LLM_DEFAULT_TOKENS", "1024"))
-LLM_LONG_TOKENS = int(os.environ.get("LLM_LONG_TOKENS", "4096"))
-HISTORY_CHARS = int(os.environ.get("HISTORY_CHARS", "7000"))
-LLM_FIRST_TOKEN_TIMEOUT = float(os.environ.get("LLM_FIRST_TOKEN_TIMEOUT", "60"))  # 秒,超时必给出错误,绝不静默卡死
+USE_DEEPSEEK = os.environ.get("LLM_BACKEND", "deepseek") == "deepseek"  # v7: 文本对话走 DeepSeek API;设 LLM_BACKEND=local 可回到本地 Qwen3-4B
+LLM_DEFAULT_TOKENS = int(os.environ.get("LLM_DEFAULT_TOKENS", "4096"))
+LLM_LONG_TOKENS = int(os.environ.get("LLM_LONG_TOKENS", "16384"))
+HISTORY_CHARS = int(os.environ.get("HISTORY_CHARS", "24000"))
+LLM_FIRST_TOKEN_TIMEOUT = float(os.environ.get("LLM_FIRST_TOKEN_TIMEOUT", "45"))  # 秒,超时必给出错误,绝不静默卡死
 LLM_STALL_TIMEOUT = float(os.environ.get("LLM_STALL_TIMEOUT", "45"))
 
 # ---- 流式 TTS ----
@@ -55,7 +56,7 @@ LLM_MAX_MEM_GIB = float(os.environ.get("LLM_MAX_MEM_GIB", "4.6"))
 TTS_LOAD_RETRIES = int(os.environ.get("TTS_LOAD_RETRIES", "2"))
 
 # 采样参数:温度越低越稳(音色更一致、杂音更少),越高越有情绪起伏。0.75 是实测的折中。
-TTS_TEMPERATURE = float(os.environ.get("TTS_TEMPERATURE", "0.75"))
+TTS_TEMPERATURE = float(os.environ.get("TTS_TEMPERATURE", "0.65"))
 TTS_TOP_K = int(os.environ.get("TTS_TOP_K", "40"))
 TTS_TOP_P = float(os.environ.get("TTS_TOP_P", "0.95"))
 
