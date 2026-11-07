@@ -16,7 +16,7 @@ function wav(sec, sr) {
   return b;
 }
 (async () => {
-  const srv = spawn("python3", ["-m", "uvicorn", "server.app:app", "--port", PORT, "--no-access-log"], { cwd: ROOT, env: { ...process.env, CLONE_MOCK: "1", LLM_BACKEND: "local", CLONE_DATA: path.join(ROOT, "data_test_bs") }, stdio: "ignore" });
+  const srv = spawn("python3", ["-m", "uvicorn", "server.app:app", "--port", PORT, "--no-access-log"], { cwd: ROOT, env: { ...process.env, CLONE_MOCK: "1", CLONE_DATA: path.join(ROOT, "data_test_bs") }, stdio: "ignore" });
   try {
     for (let i = 0; i < 80; i++) { try { if ((await fetch(BASE + "/api/health")).ok) break; } catch (e) {} await new Promise((r) => setTimeout(r, 500)); }
     await new Promise((r) => setTimeout(r, 2500));
