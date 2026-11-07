@@ -49,7 +49,7 @@ def parse_frames(buf: bytearray):
     return out
 
 
-env = dict(os.environ, CLONE_MOCK="1", LLM_BACKEND="local", PORT=str(PORT), CLONE_DATA=str(ROOT / "data_test_stream"), PYTHONUNBUFFERED="1")
+env = dict(os.environ, CLONE_MOCK="1", PORT=str(PORT), CLONE_DATA=str(ROOT / "data_test_stream"), PYTHONUNBUFFERED="1")
 p = subprocess.Popen([sys.executable, "-m", "uvicorn", "server.app:app", "--port", str(PORT), "--no-access-log"],
                      cwd=ROOT, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 try:
