@@ -409,7 +409,9 @@ async function pollJob() {
     if (window.__vcEmit && pollJob.last !== j.state + "|" + j.stage) { pollJob.last = j.state + "|" + j.stage; window.__vcEmit({ kind: "train", msg: "训练 " + j.state + " · " + (j.stage || "") + " · " + (j.progress || 0) + "%" }); }
     $("pall").style.width = (j.progress || 0) + "%";
     $("gl").innerHTML = (j.gpus || []).map((g) => `<b style="color:#cfd6ff">GPU${g.gpu}</b><div class="prog"><i style="width:${g.progress}%"></i></div><span class="m">${g.msg}</span>`).join("")
-      + `<span class="m" style="color:#cfd6ff">${j.stage || ""}</span>`;
+      + `<span class="m" style="color:#cfd6ff">${j.stage || ""}</span>`
+      + (j.state === "error" ? `<span class="m" style="color:#ff8a8a;white-space:pre-wrap">❌ ${String(j.error || "").replace(/</g, "&lt;")}\n${(j.log || []).slice(-6).join("\n").replace(/</g, "&lt;")}</span>` : "")
+      + (j.state === "running" && j.started ? `<span class="m">阶段日志:${(j.log || []).slice(-2).join(" | ").replace(/</g, "&lt;")}</span>` : "");
     $("warns").textContent = (j.warnings || []).join(" · ");
     if (j.state === "done" || j.state === "error") {
       clearInterval(jobTimer); jobTimer = null; $("train").disabled = !refBlob;
