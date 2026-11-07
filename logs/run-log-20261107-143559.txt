@@ -1,0 +1,159 @@
+Voice Clone Studio · 运行日志
+生成时间: 2026/11/7 14:35:58
+页面: https://cork-animals-earnings-halo.trycloudflare.com/
+
+════ 概览 ════
+代码版本: v7 | 运行 362.8s | Python 3.12.13 | Kaggle
+公网地址: — | ffmpeg: /usr/bin/ffmpeg | CUDA_VISIBLE_DEVICES: —
+内存: 进程 685324 kB / 可用 25557964 kB / 总 32869296 kB | 磁盘剩余 19.5 GB
+精度 TTS_DTYPE=bfloat16 LLM_DTYPE=float16
+
+════ 瓶颈分析(哪里慢 / 哪里还能提升) ════
+🔵 [训练] 最慢阶段:双卡并行:声纹提取 + 文本识别 + 合成校验 用了 13.3s(占 88% / 总计 15.1s)
+     ↳ 建议:GPU 合成校验句是主要耗时:检查 TTS_DTYPE 是否被降级到 float32(慢约 2 倍),必要时重启单元格;看下方『环节耗时』里 gpu0/gpu1 哪张更慢。
+🔵 [上传] 浏览器端压缩 423 KB → 1274 KB(301%)
+🔵 [环节] gpu1/synth_icl 平均 9.0s(最大 12.9s,2 次)
+🔵 [环节] gpu0/prepare_xvec 平均 5.4s(最大 10.5s,2 次)
+🟢 [上传] 上传正常:1274 KB / 4.0s(317 KB/s)
+🟢 [对话] 首声延迟 1.41s(LLM 首字 767ms)
+
+════ 训练任务 ════
+状态: done | 阶段: 训练完成 | 进度: 100% | 已用: 15.1s | 模式 xvec | 相似度 96.56%
+警告: 环境噪声较大(信噪比约 18dB),建议在安静环境重录
+  +0.0s  等待模型加载  (用时 0.0s)
+  +0.0s  参考音频清洗(解码/降噪/切静音/归一化)  (用时 0.7s)
+  +0.7s  双卡并行:声纹提取 + 文本识别 + 合成校验  (用时 13.3s)
+  +14.0s  同步声音到双卡  (用时 1.1s)
+  +15.1s  训练完成  (用时 0.0s)
+  GPU0: 100% 完成
+  GPU1: 100% 完成
+  | [06:33:20] 参考音频 19.7s, 信噪比≈18dB
+  | [06:33:34] 模式 xvec 说话人相似度 96.56%
+  | [06:33:34] 模式 icl 说话人相似度 54.98%
+  | [06:33:35] 完成(15.1s),选用模式 xvec,相似度 96.56%
+
+════ 各环节耗时(服务端剖析,按累计耗时降序) ════
+  train/TOTAL                        次数   2 平均 17.45s  P95 19.8s  最大 19.8s  最近 15.1s  累计 34.9s
+  chat/turn_total                    次数   2 平均 10.279s  P95 10.88s  最大 10.88s  最近 10.88s  累计 20.56s
+  gpu1/synth_icl                     次数   2 平均 9.037s  P95 12.901s  最大 12.901s  最近 12.901s  累计 18.07s
+  train/自动识别参考语音文本 (Whisper @ GPU1)  次数   1 平均 14.4s  P95 14.4s  最大 14.4s  最近 14.4s  累计 14.4s
+  train/双卡并行:声纹提取 + 文本识别 + 合成校验      次数   2 平均 6.65s  P95 13.3s  最大 13.3s  最近 13.3s  累计 13.3s
+  gpu0/prepare_xvec                  次数   2 平均 5.369s  P95 10.544s  最大 10.544s  最近 0.193s  累计 10.74s
+  gpu0/synth_xvec                    次数   2 平均 3.863s  P95 4.083s  最大 4.083s  最近 4.083s  累计 7.73s
+  train/参考音频清洗(解码/降噪/切静音/归一化)        次数   2 平均 1.95s  P95 3.2s  最大 3.2s  最近 0.7s  累计 3.9s
+  cpu/preprocess_reference           次数   2 平均 1.661s  P95 2.834s  最大 2.834s  最近 0.488s  累计 3.32s
+  train/同步声音到双卡                      次数   2 平均 1.65s  P95 2.2s  最大 2.2s  最近 1.1s  累计 3.3s
+  chat/first_audio                   次数   2 平均 1.32s  P95 1.407s  最大 1.407s  最近 1.407s  累计 2.64s
+  chat/llm_first_token               次数   2 平均 0.65s  P95 0.767s  最大 0.767s  最近 0.767s  累计 1.3s
+  aux/whisper_asr                    次数   1 平均 0.823s  P95 0.823s  最大 0.823s  最近 0.823s  累计 0.82s
+  aux/similarity_xvec                次数   2 平均 0.311s  P95 0.387s  最大 0.387s  最近 0.387s  累计 0.62s
+  gpu1/prepare_icl                   次数   2 平均 0.268s  P95 0.34s  最大 0.34s  最近 0.196s  累计 0.54s
+  cpu/decode_audio                   次数   2 平均 0.204s  P95 0.278s  最大 0.278s  最近 0.131s  累计 0.41s
+  upload/chunk_recv                  次数  15 平均 0.027s  P95 0.031s  最大 0.032s  最近 0.022s  累计 0.4s
+  aux/similarity_icl                 次数   2 平均 0.201s  P95 0.226s  最大 0.226s  最近 0.226s  累计 0.4s
+  upload/assemble                    次数   2 平均 0.001s  P95 0.001s  最大 0.001s  最近 0s  累计 0s
+  train/等待模型加载                       次数   2 平均 0s  P95 0s  最大 0s  最近 0s  累计 0s
+
+════ 模型进程 ════
+  tts0 GPU0 ready 加载 17.1s dtype=bfloat16
+  tts1 GPU1 ready 加载 19.8s dtype=bfloat16
+  aux GPU1 ready 加载 22.6s
+
+════ GPU ════
+  GPU0 Tesla T4 显存 4.9/15.0 GB 利用率 0%
+  GPU1 Tesla T4 显存 8.1/15.0 GB 利用率 0%
+
+════ 声音 ════
+  {"id":"d29a5ced","ref_file":"ref_d29a5ced.wav","ref_text":"晚风吹动着竹林月光拉着了声音音火中一线伤买下飞舞的铅笔点上银河在发光背上风来","mode":"xvec","similarity":0.9656276106834412,"scores":{"xvec":0.9656276106834412,"icl":0.5497602224349976},"target_rms_db":-24.565350065968317,"quality":{"duration":19.68,"snr_db":22.3,"rms_db":-24.6,"clip_ratio":0,"snr_db_raw":17.6},"trained_at":1794033215.1743953,"modes":["icl","xvec"],"lang":"Chi | 语气词缓存 5
+  最近一轮对话: 首声 1407ms | LLM 首字 767ms | 音频 14.96s | 总 10880ms | 块 31
+
+════ 关键配置 ════
+  CODE_VERSION=v7  TTS_MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-Base  LLM_MODEL=Qwen/Qwen3-4B-Instruct-2507  LLM_DEFAULT_TOKENS=4096  LLM_LONG_TOKENS=16384  LLM_FIRST_TOKEN_TIMEOUT=45  LLM_STALL_TIMEOUT=45  TTS_STREAM=true  TTS_CHUNK_FIRST=4  TTS_CHUNK_NEXT=8  FIRST_MIN_CHARS=3  FIRST_MAX_CHARS=14  NEXT_MIN_CHARS=14  NEXT_MAX_CHARS=48  LLM_SPLIT=true  LLM_MAX_MEM_GIB=4.6  TTS_LOAD_RETRIES=2  TTS_TEMPERATURE=0.65  TTS_TOP_K=40  TTS_TOP_P=0.95  TTS_DTYPE=bfloat16  LLM_DTYPE=float16  TRAIN_AUX_WAIT=30  TRAIN_SYNTH_STALL=240  TRAIN_CHUNK=16  TRAIN_MAX_SECONDS=900  TRAIN_ASR_WAIT=90
+
+════ 浏览器端 ════
+联网: true | 连接指示: 已连接 | 网络类型: 3g RTT 400ms 下行 0.55Mbps | 安全上下文: true
+UA: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/159.0.0.0 Safari/537.36
+  /api/status         次数 139 失败 56 平均 1093ms 最大 7945ms
+  /api/ping           次数 65 失败 36 平均 617ms 最大 5256ms
+  /api/deepseek       次数 3 失败 0 平均 18882ms 最大 30690ms
+  /api/voice/chunk    次数 17 失败 1 平均 3389ms 最大 14698ms
+  /api/diag           次数 24 失败 7 平均 2655ms 最大 11607ms
+  /api/voice/train    次数 2 失败 0 平均 411ms 最大 414ms
+  /api/voice/job      次数 68 失败 35 平均 1282ms 最大 7889ms
+  /api/chat           次数 2 失败 0 平均 4567ms 最大 8721ms
+  /api/events         次数 25 失败 0 平均 1417ms 最大 23143ms
+  播放器: {"state":"running","sr":48000,"underruns":1}
+  最近错误:
+   ! 14:35:11 http-fail /api/ping signal is aborted without reason 6001ms
+   ! 14:35:14 http-fail /api/status signal is aborted without reason 8236ms
+   ! 14:35:14 http-fail /api/status signal is aborted without reason 8235ms
+   ! 14:35:17 http-fail /api/status signal is aborted without reason 8430ms
+   ! 14:35:17 http-fail /api/ping signal is aborted without reason 6336ms
+   ! 14:35:37 http-fail /api/ping signal is aborted without reason 6000ms
+   ! 14:35:38 http-fail /api/status signal is aborted without reason 8000ms
+   ! 14:35:41 http-fail /api/status signal is aborted without reason 8003ms
+   ! 14:35:41 http-fail /api/diag signal is aborted without reason 12002ms
+   ! 14:35:42 http-fail /api/ping signal is aborted without reason 6001ms
+   ! 14:35:44 http-fail /api/diag signal is aborted without reason 12015ms
+   ! 14:35:44 http-fail /api/status signal is aborted without reason 8018ms
+   ! 14:35:47 http-fail /api/diag signal is aborted without reason 12001ms
+   ! 14:35:47 http-fail /api/status signal is aborted without reason 8003ms
+   ! 14:35:47 http-fail /api/ping signal is aborted without reason 6001ms
+
+════ 浏览器事件(最近 40 条) ════
+  14:34:30 [stats]   
+  14:34:36 [http-fail] GET /api/ping 6002ms signal is aborted without reason
+  14:34:37 [http-fail] GET /api/status 8005ms signal is aborted without reason
+  14:34:40 [stats]   
+  14:34:40 [http-fail] GET /api/status 8001ms signal is aborted without reason
+  14:34:41 [http-fail] GET /api/ping 6000ms signal is aborted without reason
+  14:34:43 [ui]   页面 hidden
+  14:34:43 [http-fail] GET /api/status 8013ms signal is aborted without reason
+  14:34:46 [http-fail] GET /api/status 8011ms signal is aborted without reason
+  14:34:46 [http-fail] GET /api/ping 6013ms signal is aborted without reason
+  14:34:49 [http-fail] GET /api/status 8016ms signal is aborted without reason
+  14:34:50 [stats]   
+  14:35:00 [stats]   
+  14:35:05 [ui]   页面 visible
+  14:35:06 [http-fail] GET /api/ping 6000ms signal is aborted without reason
+  14:35:07 [ui]   点击 #logbtn
+  14:35:07 [http-fail] GET /api/status 8000ms signal is aborted without reason
+  14:35:10 [stats]   
+  14:35:10 [http-fail] GET /api/status 8002ms signal is aborted without reason
+  14:35:11 [http-fail] GET /api/ping 6001ms signal is aborted without reason
+  14:35:13 [ui]   页面 hidden
+  14:35:14 [http-fail] GET /api/status 8236ms signal is aborted without reason
+  14:35:14 [http-fail] GET /api/status 8235ms signal is aborted without reason
+  14:35:17 [http-fail] GET /api/status 8430ms signal is aborted without reason
+  14:35:17 [http-fail] GET /api/ping 6336ms signal is aborted without reason
+  14:35:21 [stats]   
+  14:35:31 [stats]   
+  14:35:37 [http-fail] GET /api/ping 6000ms signal is aborted without reason
+  14:35:38 [http-fail] GET /api/status 8000ms signal is aborted without reason
+  14:35:41 [stats]   
+  14:35:41 [http-fail] GET /api/status 8003ms signal is aborted without reason
+  14:35:41 [http-fail] GET /api/diag 12002ms signal is aborted without reason
+  14:35:42 [http-fail] GET /api/ping 6001ms signal is aborted without reason
+  14:35:44 [http-fail] GET /api/diag 12015ms signal is aborted without reason
+  14:35:44 [http-fail] GET /api/status 8018ms signal is aborted without reason
+  14:35:47 [http-fail] GET /api/diag 12001ms signal is aborted without reason
+  14:35:47 [http-fail] GET /api/status 8003ms signal is aborted without reason
+  14:35:47 [http-fail] GET /api/ping 6001ms signal is aborted without reason
+  14:35:51 [stats]   
+  14:35:56 [ui]   页面 visible
+
+════ 服务端日志(最近 80 行) ════
+  14:30:11   [engine] worker tts0 就绪 (17s) {'device': 'cuda(GPU0)', 'dtype': 'bfloat16', 'engine': 'faster-qwen3-tts(CUDA Graph 流式)', '_ms': 16806.7, 'load_s': 17.1}
+  14:30:14   [engine] worker tts1 就绪 (20s) {'device': 'cuda(GPU1)', 'dtype': 'bfloat16', 'engine': 'faster-qwen3-tts(CUDA Graph 流式)', '_ms': 19521.0, 'load_s': 19.8}
+  14:30:17   [engine] worker aux 就绪 (23s) {'device': 'cuda(GPU1)', 'asr': True, 'sv': True, 'errors': {}, '_ms': 22289.6, 'load_s': 22.6}
+  14:31:48   [train] 参考音频 18.6s, 信噪比≈4dB
+  14:31:49   [train] 识别文本: 晚风吹动着竹林月光拉着了声音音火中一线伤买下飞舞的铅笔点上银河在发光背上风来
+  14:32:02   [train] 模式 xvec 说话人相似度 84.06%
+  14:32:02   [train] 模式 icl 说话人相似度 82.41%
+  14:32:04   [train] 完成(19.8s),选用模式 xvec,相似度 84.06%
+  14:32:08   [engine] 语气词缓存 5/5 就绪
+  14:33:20   [train] 参考音频 19.7s, 信噪比≈18dB
+  14:33:34   [train] 模式 xvec 说话人相似度 96.56%
+  14:33:34   [train] 模式 icl 说话人相似度 54.98%
+  14:33:35   [train] 完成(15.1s),选用模式 xvec,相似度 96.56%
+  14:33:39   [engine] 语气词缓存 5/5 就绪
