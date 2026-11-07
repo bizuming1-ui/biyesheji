@@ -120,6 +120,23 @@
     main>.card{display:none;order:1} main[data-tab="clone"]>#c-clone,main[data-tab="chat"]>#c-chat,
     .hide-n{display:none}
   }
+
+  /* 运行日志 */
+  .logbtn{cursor:pointer;color:#cfd6ff;border-color:rgba(124,92,255,.55);background:rgba(124,92,255,.16)}
+  .logbtn:hover{background:rgba(124,92,255,.32)}
+  #logmodal{position:fixed;inset:0;z-index:99;display:none;background:rgba(3,6,14,.78);backdrop-filter:blur(6px);padding:3vh 3vw}
+  #logmodal.show{display:block}
+  #logmodal .lbox{height:100%;display:flex;flex-direction:column;border-radius:16px;background:#0d1224;border:1px solid var(--line);overflow:hidden}
+  #logmodal .lhead{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:12px 14px;border-bottom:1px solid var(--line)}
+  #logmodal .lhead b{font-size:15px;margin-right:auto}
+  #logmodal .lbtn{padding:6px 12px;border-radius:10px;background:rgba(255,255,255,.07);border:1px solid var(--line);font-size:12px}
+  #logmodal .lbtn:hover{background:rgba(255,255,255,.14)}
+  #logmodal .lbody{flex:1;overflow:auto;padding:14px;display:flex;flex-direction:column;gap:12px}
+  #logmodal .an{display:grid;gap:6px}
+  #logmodal .ai{padding:8px 11px;border-radius:10px;border-left:4px solid var(--mut);background:rgba(255,255,255,.04);font-size:13px;line-height:1.55}
+  #logmodal .ai.bad{border-color:var(--bad)} #logmodal .ai.warn{border-color:var(--warn)} #logmodal .ai.ok{border-color:var(--ok)} #logmodal .ai.info{border-color:var(--a2)}
+  #logmodal .ai small{display:block;color:var(--mut)}
+  #logmodal pre{white-space:pre-wrap;word-break:break-all;font:12px/1.55 ui-monospace,Menlo,Consolas,monospace;color:#c9d1f5;background:#070b17;border:1px solid var(--line);border-radius:10px;padding:12px;user-select:text}
 </style>
 <script>
 /* ===== 检测探针 v1 =====
@@ -140,7 +157,7 @@
     var k = cls(url), s = ST[k] = ST[k] || { n: 0, fail: 0, sum: 0, max: 0 };
     return of(u, o).then(function (r) {
       var ms = Math.round(performance.now() - t0); s.n++; s.sum += ms; if (ms > s.max) s.max = ms;
-      var routine = /^(ping|status|events|voice\/job)$/.test(k);
+      var routine = /^(ping|status|events|voice\/job|voice\/chunk|voice\/chunk_status|diag|perf)$/.test(k);
       if (!r.ok || !routine) emit({ kind: "http", method: m, url: url.replace(/sid=[^&]+/, "sid=*").slice(0, 120), status: r.status, ms: ms });
       return r;
     }, function (err) {
@@ -184,6 +201,7 @@
 <div class="app">
   <header>
     <div class="logo"><i>🎙</i>Voice Clone Studio</div>
+    <button class="chip logbtn" id="logbtn" title="运行日志:全面检测哪一部分慢、哪一部分还能提升">📋 运行日志</button>
     <div class="sp"></div>
     <div class="chip hide-n"><span class="dot" id="d-conn"></span>连接 <b id="t-conn">…</b></div>
     <div class="chip hide-n"><span class="dot" id="d-llm"></span>对话 <b id="t-llm">…</b></div>
@@ -236,6 +254,17 @@
     <nav class="tabs"><button data-t="clone">🎤 克隆</button><button data-t="chat" class="on">💬 对话</button></nav>
   </main>
 </div>
+<div id="logmodal"><div class="lbox">
+  <div class="lhead"><b>📋 运行日志 · 性能剖析</b>
+    <label style="font-size:12px;color:var(--mut)"><input type="checkbox" id="logauto" checked /> 自动刷新</label>
+    <button class="lbtn" id="logrefresh">🔄 刷新</button>
+    <button class="lbtn" id="logcopy">📄 复制全部</button>
+    <button class="lbtn" id="logtxt">⬇ 下载 .txt</button>
+    <button class="lbtn" id="logjson">⬇ 下载 .json</button>
+    <button class="lbtn" id="loggh">🐙 复制并打开 GitHub(logs/)</button>
+    <button class="lbtn" id="logclose">✕ 关闭</button></div>
+  <div class="lbody"><div class="an" id="logan"></div><pre id="logpre">加载中…</pre></div>
+</div></div>
 <div id="toast"></div>
 
 <script>
@@ -389,16 +418,110 @@ $("file").onchange = (e) => { const f = e.target.files[0]; if (f) { setRef(f); t
 $("clear").onclick = () => { refBlob = null; $("preview").style.display = "none"; $("train").disabled = true; $("rectime").textContent = "00:00"; };
 
 /* ---------------- 训练 ---------------- */
+/* ---------------- 参考音频压缩 + 分块上传(v6) ----------------
+   根因:几 MB 的整段上传经公网隧道经常卡住/被掐断(界面停在「正在上传参考音频」且连接显示重连中)。
+   做法:① 浏览器端先解码→单声道→24kHz→最多 30 秒→16bit WAV(70 秒录音 4.6MB → 约 1.4MB,服务端本来也只用前 20 秒);
+        ② 切成 192KB 小块并行上传,每块独立超时/重试,已到达的块不重传(断点续传);
+        ③ 全部到齐后再发一个很小的「开始训练」请求(幂等)。 */
+function wavBlob(f32, sr) {
+  const n = f32.length, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+  const w = (o, t) => { for (let i = 0; i < t.length; i++) v.setUint8(o + i, t.charCodeAt(i)); };
+  w(0, "RIFF"); v.setUint32(4, 36 + n * 2, true); w(8, "WAVE"); w(12, "fmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+  v.setUint16(22, 1, true); v.setUint32(24, sr, true); v.setUint32(28, sr * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  w(36, "data"); v.setUint32(40, n * 2, true);
+  for (let i = 0, o = 44; i < n; i++, o += 2) { const x = Math.max(-1, Math.min(1, f32[i])); v.setInt16(o, x < 0 ? x * 0x8000 : x * 0x7fff, true); }
+  return new Blob([buf], { type: "audio/wav" });
+}
+async function prepareRef(blob) {
+  const t0 = performance.now(), res = { blob: blob, name: "ref.webm", src_kb: Math.round(blob.size / 1024), mode: "raw", ms: 0 };
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext, SR = 24000, MAXS = 30;
+    const ab = await blob.arrayBuffer(), ac = new AC();
+    let buf;
+    try { buf = await Promise.race([ac.decodeAudioData(ab), sleep(20000).then(() => { throw new Error("解码超时"); })]); } finally { try { ac.close(); } catch (_) {} }
+    const n = Math.min(buf.length, Math.floor(MAXS * buf.sampleRate)), ch = buf.numberOfChannels, mono = new Float32Array(n);
+    for (let c = 0; c < ch; c++) { const d = buf.getChannelData(c); for (let i = 0; i < n; i++) mono[i] += d[i] / ch; }
+    let pcm = mono;
+    if (buf.sampleRate !== SR) {
+      const oc = new OfflineAudioContext(1, Math.max(1, Math.round((n / buf.sampleRate) * SR)), SR), b = oc.createBuffer(1, n, buf.sampleRate);
+      b.copyToChannel(mono, 0);
+      const src = oc.createBufferSource(); src.buffer = b; src.connect(oc.destination); src.start();
+      pcm = (await oc.startRendering()).getChannelData(0);
+    }
+    if (pcm.length < SR * 1.0) throw new Error("音频太短");
+    res.blob = wavBlob(pcm, SR); res.name = "ref.wav"; res.mode = "wav24k"; res.secs = pcm.length / SR;
+  } catch (e) { res.err = String((e && e.message) || e); }  // 解码失败:原文件照样分块上传,服务端用 ffmpeg 解码
+  res.ms = Math.round(performance.now() - t0); res.kb = Math.round(res.blob.size / 1024);
+  return res;
+}
+function makeUid() { return (window.crypto && crypto.randomUUID ? crypto.randomUUID().replace(/-/g, "") : Math.random().toString(36).slice(2) + Date.now().toString(36)).slice(0, 32); }
+async function uploadChunks(prep, onProg) {
+  const blob = prep.blob, CH = 192 * 1024, total = Math.max(1, Math.ceil(blob.size / CH));
+  prep.uid = prep.uid || makeUid();
+  const uid = prep.uid, have = new Set(), t0 = performance.now(), st = { retries: 0, sent: 0 };
+  try { const r = await jfetch("/api/voice/chunk_status?uid=" + uid, {}, 6000); if (r.ok) { const j = await r.json(); if (j.total === total) (j.got || []).forEach((i) => have.add(i)); } } catch (_) {}
+  const todo = []; for (let i = 0; i < total; i++) if (!have.has(i)) todo.push(i);
+  async function sendOne(i) {
+    const part = blob.slice(i * CH, Math.min(blob.size, (i + 1) * CH)); let d = 500;
+    for (let a = 0; a < 8; a++) {
+      try {
+        const r = await jfetch("/api/voice/chunk?uid=" + uid + "&idx=" + i + "&total=" + total, { method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: part }, 25000);
+        if (r.ok) { setConn(true); have.add(i); st.sent += part.size; onProg(have.size / total, st.sent / 1024 / Math.max(0.2, (performance.now() - t0) / 1000), st.retries, total); return; }
+        if (r.status === 404 || r.status === 405) { const e = new Error("legacy"); e.legacy = true; throw e; }
+        if (r.status >= 400 && r.status < 500) { const e = new Error("分块被拒绝 HTTP " + r.status + " " + (await r.text()).slice(0, 120)); e.fatal = true; throw e; }
+      } catch (e) { if (e.fatal || e.legacy) throw e; setConn(false); }
+      st.retries++; await sleep(d); d = Math.min(4000, d * 1.7);
+    }
+    throw new Error("第 " + (i + 1) + "/" + total + " 块上传多次失败(网络/隧道不稳定)");
+  }
+  let k = 0;
+  await Promise.all([0, 1, 2].map(async () => { while (k < todo.length) { const i = todo[k++]; await sendOne(i); } }));
+  return { uid: uid, total: total, retries: st.retries, ms: Math.round(performance.now() - t0), bytes: blob.size };
+}
+let refPrep = null, refPrepFor = null;
 $("train").onclick = async () => {
   if (!refBlob) return;
-  const fd = new FormData(); fd.append("file", refBlob, "ref.webm"); fd.append("text", $("reftext").value); fd.append("lang", scriptIdx % SCRIPTS.length === 2 ? "en" : "zh");
+  const text = $("reftext").value, lang = scriptIdx % SCRIPTS.length === 2 ? "en" : "zh", emit = window.__vcEmit || function () {};
   $("train").disabled = true; $("result").style.display = "none"; $("warns").textContent = "";
-  $("pall").style.width = "2%"; $("gl").innerHTML = '<span class="m" style="color:#cfd6ff">已点击开始训练 · 正在上传参考音频(' + (refBlob.size / 1024).toFixed(0) + ' KB)…</span>';
-  if (window.__vcEmit) window.__vcEmit({ kind: "train", msg: "开始训练 上传 " + refBlob.size + " 字节" });
-  let r = null;
-  for (let i = 0; i < 4 && !r; i++) { try { r = await jfetch("/api/voice/train", { method: "POST", body: fd }, 60000); } catch (e) { await sleep(800 * (i + 1)); } }
-  if (!r) { toast("无法连接服务器,请稍后再点开始训练", 5000); $("train").disabled = false; return; }
-  if (!r.ok) { const j = await r.json().catch(() => ({})); toast("启动训练失败: " + (j.detail || r.status), 5000); $("train").disabled = false; return; }
+  const say = (h, w) => { if (w != null) $("pall").style.width = w + "%"; $("gl").innerHTML = '<span class="m" style="color:#cfd6ff">' + h + "</span>"; };
+  const fail = (m) => { toast(m, 6000); say("❌ " + m + " · 可再次点击『开始训练』(已上传的分块不会重传)"); $("train").disabled = false; };
+  say("已点击开始训练 · 正在压缩参考音频(" + (refBlob.size / 1024).toFixed(0) + " KB)…", 2);
+  emit({ kind: "train", msg: "开始训练 原始 " + refBlob.size + " 字节" });
+  if (refPrepFor !== refBlob) { refPrep = await prepareRef(refBlob); refPrepFor = refBlob; }
+  const prep = refPrep;
+  emit({ kind: "perf", msg: "compress", ms: prep.ms, extra: JSON.stringify({ src_kb: prep.src_kb, kb: prep.kb, mode: prep.mode, err: prep.err || null }) });
+  let up = null, ok = false, legacy = false;
+  try {
+    up = await uploadChunks(prep, (f, kbps, rt, total) => say("正在上传参考音频 " + Math.round(f * 100) + "% · " + kbps.toFixed(0) + " KB/s · " + prep.kb + " KB" + (rt ? " · 已自动重试 " + rt + " 次" : ""), 2 + Math.round(f * 10)));
+    ok = true;
+  } catch (e) {
+    if (e.legacy) legacy = true;
+    else {
+      emit({ kind: "perf", msg: "upload", ms: 0, extra: JSON.stringify({ ok: false, kb: prep.kb, src_kb: prep.src_kb, retries: 0, err: String(e.message).slice(0, 80) }) });
+      return fail(e.message);
+    }
+  }
+  say("上传完成 · 正在启动训练…", 12);
+  let r = null, last = "";
+  if (legacy) {  // 旧版服务端(没有分块接口):退回一次性上传
+    const fd = new FormData(); fd.append("file", prep.blob, prep.name); fd.append("text", text); fd.append("lang", lang);
+    for (let i = 0; i < 4 && !r; i++) { try { r = await jfetch("/api/voice/train", { method: "POST", body: fd }, 90000); } catch (e) { await sleep(800 * (i + 1)); } }
+  } else {
+    for (let round = 0; round < 3 && !(r && r.ok); round++) {
+      for (let i = 0; i < 6; i++) {
+        try {
+          r = await jfetch("/api/voice/train_uploaded", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ uid: up.uid, total: up.total, text: text, lang: lang }) }, 20000);
+          break;
+        } catch (e) { r = null; await sleep(600 * (i + 1)); }
+      }
+      if (r && r.status === 422) { try { await uploadChunks(prep, () => {}); } catch (e) { last = e.message; } continue; }  // 个别块丢失:补传后重试
+      break;
+    }
+  }
+  if (!r) return fail("无法连接服务器,请稍后再点开始训练" + (last ? "(" + last + ")" : ""));
+  if (!r.ok) { const j = await r.json().catch(() => ({})); return fail("启动训练失败: " + (typeof j.detail === "string" ? j.detail : r.status)); }
+  if (up) emit({ kind: "perf", msg: "upload", ms: up.ms, extra: JSON.stringify({ ok: true, kb: prep.kb, src_kb: prep.src_kb, kbps: Math.round(up.bytes / 1024 / Math.max(0.05, up.ms / 1000)), retries: up.retries, chunks: up.total }) });
+  say("训练已启动 · 双卡准备中…", 14);
   startJobPoll();
 };
 function startJobPoll() { clearInterval(jobTimer); jobTimer = setInterval(pollJob, 800); pollJob(); }
@@ -591,6 +714,104 @@ const viz = $("viz"), vctx = viz.getContext("2d");
 $("enter").onclick = () => { player.ensure(); $("gate").style.display = "none"; };
 document.querySelectorAll(".tabs button").forEach((b) => (b.onclick = () => { $("main").dataset.tab = b.dataset.t; document.querySelectorAll(".tabs button").forEach((x) => x.classList.toggle("on", x === b)); }));
 document.addEventListener("pointerdown", () => player.ctx && player.ctx.state !== "running" && player.ctx.resume(), { passive: true });
+
+/* ---------------- 运行日志 / 性能剖析(v6) ----------------
+   顶部「📋 运行日志」:读取服务端 /api/diag(含 perf 耗时统计 + 瓶颈分析)和浏览器端事件,生成一份完整报告,
+   可复制 / 下载 / 一键复制并打开 GitHub 新建 logs/ 文件页。 */
+(function () {
+  const REPO = "bizuming1-ui/biyesheji";
+  let LAST = null, LASTTXT = "", timer = null;
+  const esc = (t) => String(t == null ? "" : t).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  const f1 = (x) => (x == null || isNaN(x) ? "—" : Number(x).toFixed(1));
+  const hms = (t) => { try { return new Date(t * 1000).toLocaleTimeString("zh-CN", { hour12: false }); } catch (_) { return ""; } };
+  function clientSide() {
+    const ring = (window.__VC_LOG || []).slice(), nav = navigator, c = nav.connection || {};
+    let stats = null; for (let i = ring.length - 1; i >= 0; i--) if (ring[i].kind === "stats") { try { stats = JSON.parse(ring[i].extra); } catch (_) {} break; }
+    return {
+      url: location.href, ua: nav.userAgent, online: nav.onLine, secure: window.isSecureContext,
+      net: { type: c.effectiveType || null, rtt: c.rtt != null ? c.rtt : null, downlink: c.downlink != null ? c.downlink : null },
+      conn_label: ($("t-conn") || {}).textContent || "", stats: stats,
+      errors: ring.filter((e) => /error|fail/.test(e.kind)).slice(-15), events: ring.slice(-40),
+    };
+  }
+  function buildReport(d, cs, err) {
+    const L = [], H = (t) => L.push("", "════ " + t + " ════");
+    L.push("Voice Clone Studio · 运行日志", "生成时间: " + new Date().toLocaleString("zh-CN", { hour12: false }), "页面: " + cs.url);
+    if (!d) { H("服务端"); L.push("⚠ 无法读取 /api/diag:" + err, "说明:服务端无响应(Kaggle 单元格已停止 / 隧道断开 / 服务正在重启)。下面只有浏览器端数据。"); }
+    else {
+      const sy = d.system || {}, cfg = d.config || {}, mem = sy.mem || {};
+      H("概览");
+      L.push("代码版本: " + (cfg.CODE_VERSION || "?") + " | 运行 " + f1(d.uptime_s) + "s | Python " + sy.python + " | " + (sy.kaggle ? "Kaggle" : "非 Kaggle") + (d.mock ? " | MOCK 模式" : ""),
+        "公网地址: " + (sy.public_url || "—") + " | ffmpeg: " + (sy.ffmpeg || "无") + " | CUDA_VISIBLE_DEVICES: " + (sy.cuda_visible || "—"),
+        "内存: 进程 " + (mem.VmRSS || "?") + " / 可用 " + (mem.MemAvailable || "?") + " / 总 " + (mem.MemTotal || "?") + " | 磁盘剩余 " + ((sy.disk || {}).free_gb || "?") + " GB",
+        "精度 TTS_DTYPE=" + cfg.TTS_DTYPE + " LLM_DTYPE=" + cfg.LLM_DTYPE);
+      H("瓶颈分析(哪里慢 / 哪里还能提升)");
+      const ic = { bad: "🔴", warn: "🟠", info: "🔵", ok: "🟢" };
+      (d.analysis || []).forEach((a) => { L.push(ic[a.level] + " [" + a.area + "] " + a.msg); if (a.advice) L.push("     ↳ 建议:" + a.advice); });
+      const job = d.job || {};
+      H("训练任务");
+      L.push("状态: " + (job.state || "idle") + " | 阶段: " + (job.stage || "—") + " | 进度: " + (job.progress || 0) + "% | 已用: " + (job.elapsed != null ? job.elapsed : d.job_age_s != null ? d.job_age_s : "—") + "s" + (job.mode ? " | 模式 " + job.mode : "") + (job.similarity != null ? " | 相似度 " + (job.similarity * 100).toFixed(2) + "%" : ""));
+      if (job.error) L.push("错误: " + job.error);
+      (job.warnings || []).forEach((w) => L.push("警告: " + w));
+      const tl = job.timeline || [];
+      tl.forEach((x, i) => { const nx = i + 1 < tl.length ? tl[i + 1][0] : (job.elapsed != null ? job.elapsed : d.job_age_s || x[0]); L.push("  +" + f1(x[0]) + "s  " + x[1] + "  (用时 " + f1(nx - x[0]) + "s)"); });
+      (job.gpus || []).forEach((g) => L.push("  GPU" + g.gpu + ": " + g.progress + "% " + g.msg));
+      (job.log || []).slice(-15).forEach((x) => L.push("  | " + x));
+      H("各环节耗时(服务端剖析,按累计耗时降序)");
+      const pf = Object.entries(d.perf || {}).sort((a, b) => b[1].total - a[1].total);
+      if (!pf.length) L.push("  (还没有数据)");
+      pf.forEach(([k, v]) => L.push("  " + k.padEnd(34) + " 次数 " + String(v.n).padStart(3) + " 平均 " + v.avg + "s  P95 " + v.p95 + "s  最大 " + v.max + "s  最近 " + v.last + "s  累计 " + v.total + "s"));
+      H("模型进程");
+      Object.entries(d.workers || {}).forEach(([k, w]) => L.push("  " + k + " GPU" + w.gpu + " " + w.state + (w.info && w.info.load_s ? " 加载 " + w.info.load_s + "s" : "") + (w.info && w.info.dtype ? " dtype=" + w.info.dtype : "") + (w.error ? " 错误: " + String(w.error).slice(-200) : "")));
+      H("GPU");
+      (d.gpus || []).forEach((g) => L.push("  GPU" + g.index + " " + g.name + " 显存 " + (g.mem_used / 1024).toFixed(1) + "/" + (g.mem_total / 1024).toFixed(1) + " GB 利用率 " + g.util + "%"));
+      if (!(d.gpus || []).length) L.push("  (无 GPU 数据)");
+      H("声音");
+      L.push("  " + (d.voice ? JSON.stringify(d.voice).slice(0, 400) : "未训练") + " | 语气词缓存 " + d.fillers);
+      const t = d.turn || {};
+      if (t.turn) L.push("  最近一轮对话: 首声 " + t.ttfa_ms + "ms | LLM 首字 " + t.llm_first_ms + "ms | 音频 " + t.audio_s + "s | 总 " + t.total_ms + "ms | 块 " + t.chunks);
+      H("关键配置");
+      L.push("  " + Object.entries(cfg).filter(([k]) => /^(TTS_|TRAIN_|LLM_|CODE_|FIRST_|NEXT_)/.test(k)).map(([k, v]) => k + "=" + v).join("  "));
+    }
+    H("浏览器端");
+    L.push("联网: " + cs.online + " | 连接指示: " + cs.conn_label + " | 网络类型: " + (cs.net.type || "?") + " RTT " + (cs.net.rtt == null ? "?" : cs.net.rtt + "ms") + " 下行 " + (cs.net.downlink == null ? "?" : cs.net.downlink + "Mbps") + " | 安全上下文: " + cs.secure, "UA: " + cs.ua);
+    if (cs.stats && cs.stats.http) Object.entries(cs.stats.http).forEach(([k, v]) => L.push("  /api/" + k.padEnd(14) + " 次数 " + v.n + " 失败 " + v.fail + " 平均 " + v.avg + "ms 最大 " + v.max + "ms"));
+    if (cs.stats && cs.stats.audio) L.push("  播放器: " + JSON.stringify(cs.stats.audio));
+    if (cs.errors.length) { L.push("  最近错误:"); cs.errors.forEach((e) => L.push("   ! " + new Date(e.t).toLocaleTimeString("zh-CN", { hour12: false }) + " " + e.kind + " " + (e.url || "") + " " + (e.msg || "") + (e.ms ? " " + e.ms + "ms" : ""))); }
+    H("浏览器事件(最近 40 条)");
+    cs.events.forEach((e) => L.push("  " + new Date(e.t).toLocaleTimeString("zh-CN", { hour12: false }) + " [" + e.kind + "] " + (e.method || "") + " " + (e.url || "") + (e.status ? " " + e.status : "") + (e.ms != null ? " " + e.ms + "ms" : "") + " " + (e.msg || "") + (e.kind === "stats" ? "" : e.extra ? " " + String(e.extra).slice(0, 160) : "")));
+    if (d) { H("服务端日志(最近 80 行)"); (d.server_log || []).slice(-80).forEach((x) => L.push("  " + hms(x.t) + " " + (x.src === "err" ? "E " : "  ") + x.msg)); }
+    return L.join("\n");
+  }
+  function renderAnalysis(d) {
+    const ic = { bad: "🔴", warn: "🟠", info: "🔵", ok: "🟢" };
+    $("logan").innerHTML = d ? (d.analysis || []).map((a) => '<div class="ai ' + a.level + '">' + ic[a.level] + " <b>[" + esc(a.area) + "]</b> " + esc(a.msg) + (a.advice ? "<small>↳ " + esc(a.advice) + "</small>" : "") + "</div>").join("")
+      : '<div class="ai bad">🔴 服务端无响应:无法读取 /api/diag(Kaggle 单元格是否仍在运行?隧道是否重建?)</div>';
+  }
+  async function refresh() {
+    let d = null, err = "";
+    try { const r = await jfetch("/api/diag", {}, 12000); if (!r.ok) throw new Error("HTTP " + r.status); d = await r.json(); } catch (e) { err = String((e && e.message) || e); }
+    LAST = { diag: d, client: clientSide(), err: err };
+    LASTTXT = buildReport(d, LAST.client, err);
+    renderAnalysis(d); $("logpre").textContent = LASTTXT;
+  }
+  function fname(ext) { const t = new Date(), z = (n) => String(n).padStart(2, "0"); return "run-log-" + t.getFullYear() + z(t.getMonth() + 1) + z(t.getDate()) + "-" + z(t.getHours()) + z(t.getMinutes()) + z(t.getSeconds()) + "." + ext; }
+  function dl(name, text, mime) { const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([text], { type: mime })); a.download = name; document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500); }
+  async function copy(text) { try { await navigator.clipboard.writeText(text); return true; } catch (_) { const ta = document.createElement("textarea"); ta.value = text; ta.style.cssText = "position:fixed;opacity:0"; document.body.appendChild(ta); ta.select(); let ok = false; try { ok = document.execCommand("copy"); } catch (e) {} ta.remove(); return ok; } }
+  function open_() { $("logmodal").classList.add("show"); $("logpre").textContent = "加载中…"; refresh(); clearInterval(timer); timer = setInterval(() => { if ($("logauto").checked) refresh(); }, 3000); }
+  function close_() { $("logmodal").classList.remove("show"); clearInterval(timer); }
+  $("logbtn").onclick = open_; $("logclose").onclick = close_; $("logrefresh").onclick = refresh;
+  $("logmodal").addEventListener("click", (e) => { if (e.target === $("logmodal")) close_(); });
+  $("logcopy").onclick = async () => toast((await copy(LASTTXT)) ? "已复制运行日志(" + LASTTXT.length + " 字符)" : "复制失败,请手动选中文本", 3000);
+  $("logtxt").onclick = () => dl(fname("txt"), LASTTXT, "text/plain;charset=utf-8");
+  $("logjson").onclick = () => dl(fname("json"), JSON.stringify(LAST, null, 2), "application/json");
+  $("loggh").onclick = async () => {
+    const name = fname("txt"), ok = await copy(LASTTXT);
+    toast(ok ? "已复制日志,正在打开 GitHub:在编辑框里粘贴后提交" : "请先手动复制日志,再到 GitHub 粘贴", 5000);
+    window.open("https://github.com/" + REPO + "/new/main?filename=" + encodeURIComponent("logs/" + name), "_blank", "noopener");
+  };
+  window.__vcOpenLog = open_;
+})();
 </script>
 </body>
 </html>
