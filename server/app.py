@@ -13,12 +13,12 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
 import time
 
 from . import config, deepseek, diag, perf, uploads
-from .engine import Engine, pack_audio
+from .engine import K_HELLO, Engine, frame_ctl, pack_audio
 
 diag.install()  # 把服务端日志同时复制进检测日志缓冲(输出框照常显示)
 engine = Engine()
@@ -57,6 +57,12 @@ async def index():
 async def player_js():
     """无缝播放器(自适应预缓冲)。独立成文件,方便用 Node 离线仿真测试。"""
     return FileResponse(config.WEB_DIR / "player.js", media_type="application/javascript; charset=utf-8")
+
+
+@app.get("/wsola.js")
+async def wsola_js():
+    """v8: 流式 WSOLA 变速不变调(播放器在缓冲不足时轻微放慢,代替长时间预缓冲)。"""
+    return FileResponse(config.WEB_DIR / "wsola.js", media_type="application/javascript; charset=utf-8")
 
 
 @app.get("/api/deepseek")
@@ -123,7 +129,7 @@ async def favicon():
 
 
 @app.post("/api/voice/train")
-async def train(file: UploadFile = File(...), text: str = Form(""), lang: str = Form("zh")):
+async def train(file: UploadFile = File(...), text: str = Form(""), lang: str = Form("zh"), song: str = Form("0")):
     """旧接口(一次性上传整个文件)。保留兼容;新前端走下面的分块上传。"""
     t0 = time.perf_counter()
     data = await file.read()
@@ -131,7 +137,7 @@ async def train(file: UploadFile = File(...), text: str = Form(""), lang: str = 
     if len(data) < 2000:
         raise HTTPException(400, "音频文件为空或太小")
     try:
-        await engine.start_training(data, text, lang)
+        await engine.start_training(data, text, lang, song in ("1", "true", "on"))
     except RuntimeError as e:
         raise HTTPException(409, str(e))
     return {"ok": True}
@@ -171,7 +177,7 @@ async def train_uploaded(request: Request):
     if len(data) < 2000:
         raise HTTPException(400, "音频文件为空或太小")
     try:
-        await engine.start_training(data, str(body.get("text") or ""), str(body.get("lang") or "zh"))
+        await engine.start_training(data, str(body.get("text") or ""), str(body.get("lang") or "zh"), bool(body.get("song")))
     except RuntimeError as e:
         raise HTTPException(409, str(e))
     engine.last_train_uid = uid
@@ -217,6 +223,26 @@ async def chat(request: Request):
         raise HTTPException(400, "空消息")
     tid = await engine.start_chat(sid, text, dict(body.get("opts") or {}), bool(body.get("speak")))
     return {"ok": True, "tid": tid}
+
+
+@app.post("/api/chat_stream")
+async def chat_stream(request: Request):
+    """v8: 一个请求完成「创建对话 + 实时推送」:首帧 hello 立刻返回,之后文本/音频按产生顺序逐帧推送(二进制,无 base64)。
+    比旧的 POST→GET 长轮询少 1~2 个往返,也没有轮询间隙。连接中断时客户端用 hello 里的 tid + 已收事件数,回退到 /api/events 续传。"""
+    body = await request.json()
+    sid = str(body.get("sid") or "anon")[:64]
+    text = str(body.get("text", "")).strip()
+    if not text:
+        raise HTTPException(400, "空消息")
+    tid = await engine.start_chat(sid, text, dict(body.get("opts") or {}), bool(body.get("speak")))
+
+    async def gen():
+        yield frame_ctl(K_HELLO, {"tid": tid})
+        async for fr in engine.stream_events(sid, tid, 0):
+            yield fr
+
+    return StreamingResponse(gen(), media_type="application/octet-stream",
+                             headers={"Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no", "Content-Encoding": "identity"})
 
 
 @app.get("/api/events")
