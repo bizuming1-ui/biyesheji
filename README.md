@@ -77,19 +77,21 @@ Qwen3-TTS 声音克隆模型在 **T4(Turing 架构,没有原生 bf16)上用 floa
 * 失败时界面直接显示真实原因和最近日志(不再只是一闪而过的提示)。
 * 自检:`CLONE_MOCK=1 python tests/e2e_numeric.py`(模拟 NaN 崩溃 → 自动降级 → 训练成功 → 对话可用)
 
-## v7 改动(DeepSeek API 对话 + 零停顿播放 + 复制代码界面)
+## v9 改动(对话大模型直接部署在 Kaggle,彻底移除 DeepSeek / Key)
 
-* **对话大模型改为 DeepSeek 官方 API**(`server/deepseek.py`):不再加载本地 Qwen3-4B(省 ~7.5GiB 显存、少下载 ~8GB、少等几分钟)。
-  * Key 在「浏览器模拟器」右上角或网页顶部 🔑 填写;只存在浏览器本地和 Kaggle 进程内存,**不写磁盘、不进日志、不出现在任何接口响应**。
-  * 默认模型 `deepseek-v4-pro`(当前最强),界面可切 `deepseek-flash`(更快首字);**thinking 默认关闭**(思考模式首字要等推理链);可勾选「深度思考」。
-  * 长文本:`finish_reason=length` 时自动续写(最多 6 轮,对播放完全透明);首字前 429/5xx 自动退避重试;错误全部中文回显。
-  * 设置 `LLM_BACKEND=local` 可回到本地 Qwen3-4B。
-* **零停顿播放**(`web/player.js`,自适应预缓冲):服务端为每轮对话发送 `plan` 事件(预计总音频时长),
-  浏览器实测合成速度 r,按 `B ≥ E_rem·(1/r − 1)` 计算开播前需要攒多少缓冲才能一次不断;开播后块与块在采样级精确衔接;
-  真缓冲见底时只暂停一次、按最新速率重算并加大余量(滞回),不会「播—停—播—停」。离线仿真:`node tests/player_sim.js`。
+* **对话模型 = Qwen3-4B-Instruct-2507**,直接加载在 Kaggle 的两张 T4 上(fp16,按层分到两卡,每卡约 3.8GiB),不需要任何外部 API、Key、Internet 之外的账号。原生 262K 上下文,适合长文。
+* **长文本输出(`server/workers.py: RealLLM.chat`)**:一轮 `generate` 撞到 `LLM_ROUND_TOKENS`(默认 2048)而模型没有自然结束时,把已生成的文字接在提示词后面**自动续写**,直到模型自己说完或用完总预算(普通 `LLM_DEFAULT_TOKENS=6144`,「长文」模式 `LLM_LONG_TOKENS=20000`)。文字流不中断,前端只收到一个 `cont` 事件(toast 提示);用户取消时立刻停止、不再续写。
+* **不和语音抢 GPU(令牌桶限速 `Pacer`)**:语音只消耗约 3~6 token/s,LLM 在两张卡上全速生成只会拖慢 TTS(TTS 的 RTF≈0.93 已经很紧)。每轮对话前 `LLM_PACE_BURST=48` 个 token 不限速(首句、首声最快),之后限制在 `LLM_PACE_TPS=12` token/s(仍是语音消耗速度的 2~4 倍,TTS 永远不会断粮)。设 `LLM_PACE_TPS=0` 关闭。
+* **每一句都发 `plan` 事件**(旧的本地路径只在结尾发一次):播放器据此实时更新「预计总音频时长」,弹性变速/预缓冲才能做对决定 → 首声快且播放中不停顿。
+* **对话模型还在加载时点发送**:最多等 `LLM_LOAD_WAIT=900` 秒并提示「对话模型正在加载…」,加载完自动开始回答(不再直接报错)。
+* 界面「对话」指示灯直接反映本地 LLM worker 状态;`/api/ping` 返回 `llm` 状态。
+* 自检:`CLONE_MOCK=1 python tests/e2e_localllm.py`(DeepSeek 已移除 / plan 事件 / 续写 / 故障回显 / 限速);`python tests/real_llm_cpu.py`(用真实小模型在 CPU 上验证续写、取消、限速逻辑,需 torch+transformers)。
+
+## v7 改动(零停顿播放 + 复制代码界面;其中「DeepSeek API」已在 v9 移除)
+
+* **零停顿播放**(`web/player.js`,自适应预缓冲):服务端为每轮对话发送 `plan` 事件(预计总音频时长),浏览器实测合成速度 r,按 `B ≥ E_rem·(1/r − 1)` 计算开播前需要攒多少缓冲才能一次不断;开播后块与块在采样级精确衔接。离线仿真:`node tests/player_sim.js`。
 * **相似度**只显示真实测量值(WavLM 声纹余弦);未达 95% 时界面会如实提示,不会伪造数字。
-* 自检:`python tests/e2e_deepseek.py`(假 DeepSeek + Mock TTS,覆盖 Key 校验/长文续写/429 重试/402/401/Key 不泄露)。
-* 语气词先行默认关闭(DeepSeek 首字常比语气词更慢,会造成语气词后的空档)。
+* 语气词先行默认关闭(本地模型首字很快,语气词反而会造成空档)。
 
 ## v8 改动(首声最快 + 零停顿 + 歌曲参考音频 + 代码同步检测)
 
