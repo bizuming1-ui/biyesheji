@@ -202,6 +202,7 @@
   <header>
     <div class="logo"><i>🎙</i>Voice Clone Studio</div>
     <button class="chip logbtn" id="logbtn" title="运行日志:全面检测哪一部分慢、哪一部分还能提升">📋 运行日志</button>
+    <button class="chip logbtn" id="dsbtn" title="填写 DeepSeek API Key(对话大模型走 DeepSeek 官方 API,不占 GPU)">🔑 DeepSeek <b id="t-ds">未填 Key</b></button>
     <div class="sp"></div>
     <div class="chip hide-n"><span class="dot" id="d-conn"></span>连接 <b id="t-conn">…</b></div>
     <div class="chip hide-n"><span class="dot" id="d-llm"></span>对话 <b id="t-llm">…</b></div>
@@ -238,7 +239,7 @@
       <div class="opts">
         <label class="tg on" id="tgAuto">🔊 自动播放</label>
         <label class="tg on" id="tgSmooth" title="播放中途若合成跟不上,先攒够缓冲再继续,避免卡顿">🧵 无停顿优先</label>
-        <label class="tg on" id="tgFiller" title="用你的克隆声音先说「嗯,」「好的,」,0 延迟出声,正文同时在双卡合成">💬 语气词先行</label>
+        <label class="tg" id="tgFiller" title="先用缓存的克隆语气词出声(0 延迟)。DeepSeek 首字比语气词还慢时可能造成停顿,默认关闭">💬 语气词先行</label>
         <label class="tg" id="tgLong">📖 长文模式</label>
         <label class="tg hide-n">🌬 呼吸 <input type="range" id="breath" min="0" max="100" value="40" /></label>
         <button class="tg" id="reset">🧹 新对话</button>
@@ -254,6 +255,15 @@
     <nav class="tabs"><button data-t="clone">🎤 克隆</button><button data-t="chat" class="on">💬 对话</button></nav>
   </main>
 </div>
+<div id="dsmodal" style="position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:60"><div style="background:#111a33;border:1px solid #2a3868;border-radius:16px;padding:22px;width:min(460px,92vw);display:flex;flex-direction:column;gap:12px">
+  <b style="font-size:16px">🔑 DeepSeek API 设置</b>
+  <small style="color:var(--mut);line-height:1.6">Key 只保存在你浏览器本地和 Kaggle 服务进程内存里(不写磁盘、不进日志)。也可以直接在「浏览器模拟器」右上角填写,会自动同步到这里。</small>
+  <input class="t" id="dskey" type="password" placeholder="sk-xxxxxxxxxxxxxxxx" autocomplete="off" />
+  <select class="t" id="dsmodel"><option value="deepseek-v4-pro">deepseek-v4-pro(能力最强,默认)</option><option value="deepseek-flash">deepseek-flash(更快首字)</option></select>
+  <label style="font-size:13px;color:var(--mut)"><input type="checkbox" id="dsthink" /> 深度思考(能力更强,但首字会慢几秒;语音对话建议关闭)</label>
+  <div id="dsmsg" style="font-size:12px;min-height:18px;color:var(--mut)"></div>
+  <div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn" id="dsclose">关闭</button><button class="btn pri" id="dssave">保存并校验</button></div>
+</div></div>
 <div id="logmodal"><div class="lbox">
   <div class="lhead"><b>📋 运行日志 · 性能剖析</b>
     <label style="font-size:12px;color:var(--mut)"><input type="checkbox" id="logauto" checked /> 自动刷新</label>
@@ -267,6 +277,7 @@
 </div></div>
 <div id="toast"></div>
 
+<script src="/player.js"></script>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
@@ -284,60 +295,38 @@ const showScript = () => { $("scriptText").textContent = SCRIPTS[scriptIdx % SCR
 $("nextScript").onclick = () => { scriptIdx++; showScript(); };
 showScript();
 
-/* ---------------- 无缝播放器 ---------------- */
-class GaplessPlayer {
-  constructor() { this.ctx = null; this.hold = 0; this.floor = 1.2; this.reset(); this.onstate = () => {}; this.onfirst = () => {}; }
-  ensure() {
-    if (!this.ctx) {
-      this.ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
-      this.gain = this.ctx.createGain(); this.an = this.ctx.createAnalyser(); this.an.fftSize = 128;
-      this.gain.connect(this.an); this.an.connect(this.ctx.destination);
-    }
-    if (this.ctx.state !== "running") this.ctx.resume();
-  }
-  reset() { this.turn = -1; this.pending = new Map(); this.expect = 0; this.total = null; this.nextTime = 0; this.srcs = new Set(); this.waitSince = 0; this.underruns = 0; this.firstDone = false; clearTimeout(this.timer); }
-  newTurn(turn) { this.stop(); this.turn = turn; }
-  stop() {
-    for (const s of this.srcs) { try { s.onended = null; s.stop(); } catch (e) {} }
-    this.reset(); this.onstate("idle");
-  }
-  finish(total) { this.total = total; this.drain(); this.check(); }
-  push(turn, idx, sr, f32) { if (turn !== this.turn) return; this.pending.set(idx, { sr, f32 }); this.drain(); }
-  readyDur() { let d = 0, i = this.expect; while (this.pending.has(i)) { const c = this.pending.get(i); d += c.f32.length / c.sr; i++; } return d; }
-  drain() {
-    if (!this.ctx) return;
-    const now = this.ctx.currentTime;
-    const lead = this.nextTime - now;
-    const idle = this.srcs.size === 0 || lead < 0.01;
-    if (idle && this.pending.has(this.expect)) {
-      const isRe = this.expect > 0;                       // 播放中途断流 → 重新缓冲
-      const need = isRe ? Math.max(this.hold, this.floor) : (this.fillerFirst || !this.floor ? 0 : 0.6);                  // 首句立即播,中途缺料则多攒一点
-      const all = this.total !== null && this.expect + this.pending.size >= this.total;
-      if (!this.waitSince) this.waitSince = performance.now();
-      const waited = (performance.now() - this.waitSince) / 1000;
-      if (this.readyDur() < need && !all && waited < 3) { this.onstate("buffering"); clearTimeout(this.timer); this.timer = setTimeout(() => this.drain(), 120); return; }
-      if (isRe && this.srcs.size === 0 && lead < 0) { this.underruns++; this.hold = Math.min(4, this.hold + 0.7); }
-      this.waitSince = 0;
-      this.nextTime = Math.max(now + 0.03, this.nextTime);
-    }
-    while (this.pending.has(this.expect)) { const c = this.pending.get(this.expect); this.pending.delete(this.expect); this.expect++; this.sched(c); }
-  }
-  sched(c) {
-    const buf = this.ctx.createBuffer(1, c.f32.length, c.sr); buf.copyToChannel(c.f32, 0);
-    const src = this.ctx.createBufferSource(); src.buffer = buf; src.connect(this.gain);
-    const at = Math.max(this.nextTime, this.ctx.currentTime + 0.02);
-    src.start(at); this.nextTime = at + buf.duration; this.srcs.add(src);
-    src.onended = () => { this.srcs.delete(src); this.check(); };
-    this.onstate("playing");
-    if (!this.firstDone) { this.firstDone = true; this.onfirst(performance.now(), at - this.ctx.currentTime); }
-  }
-  check() {
-    if (this.total !== null && this.expect >= this.total && this.srcs.size === 0) { this.onstate("idle"); if (this.underruns === 0) this.hold = Math.max(0, this.hold - 0.15); }
-  }
-}
+/* ---------------- 无缝播放器(/player.js:自适应预缓冲) ---------------- */
 const player = new GaplessPlayer(); window.player = player;
 
 let jobTimer = null;
+/* ---------------- DeepSeek 设置(Key 存浏览器本地;模拟器可通过 postMessage 同步) ---------------- */
+function loadDs() { try { return JSON.parse(localStorage.getItem("vc_ds") || "{}"); } catch (e) { return {}; } }
+function saveDs(o) { try { localStorage.setItem("vc_ds", JSON.stringify(o)); } catch (e) { /* 隐私模式 */ } }
+function dsCfg() { const c = loadDs(); return { key: c.key || "", model: c.model || "", thinking: !!c.thinking }; }
+async function applyDs(cfg, quiet) {
+  const msg = $("dsmsg");
+  if (!quiet) { msg.style.color = "var(--mut)"; msg.textContent = "正在校验 Key 并预热连接…"; }
+  try {
+    const r = await (await fetch("/api/deepseek", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(cfg) })).json();
+    if (!r.ok) { msg.style.color = "var(--bad,#ff6b6b)"; msg.textContent = "✗ " + r.error; return false; }
+    const sel = $("dsmodel");
+    if (r.models && r.models.length) sel.innerHTML = r.models.map((m) => `<option value="${m}">${m}${m === r.model ? "(当前)" : ""}</option>`).join("");
+    sel.value = r.model; saveDs({ key: cfg.key, model: r.model, thinking: cfg.thinking });
+    msg.style.color = "var(--ok)"; msg.textContent = `✓ Key 有效 · 模型 ${r.model} · 连接预热 ${r.latency_ms}ms`;
+    pollStatus(); return true;
+  } catch (e) { msg.style.color = "var(--bad,#ff6b6b)"; msg.textContent = "✗ 请求失败:" + e.message; return false; }
+}
+$("dsbtn").onclick = () => { const c = loadDs(); $("dskey").value = c.key || ""; $("dsthink").checked = !!c.thinking; if (c.model) $("dsmodel").value = c.model; $("dsmodal").style.display = "flex"; };
+$("dsclose").onclick = () => { $("dsmodal").style.display = "none"; };
+$("dssave").onclick = async () => { const ok = await applyDs({ key: $("dskey").value.trim(), model: $("dsmodel").value, thinking: $("dsthink").checked }); if (ok) setTimeout(() => ($("dsmodal").style.display = "none"), 900); };
+window.addEventListener("message", (e) => {   // 浏览器模拟器右上角填写的 Key 同步过来
+  const d = e.data; if (!d || d.type !== "vc-deepseek" || !d.key) return;
+  const c = loadDs(); if (c.key === d.key && c.model === d.model && !!c.thinking === !!d.thinking) return;
+  applyDs({ key: String(d.key).trim(), model: d.model || "", thinking: !!d.thinking }, true);
+});
+try { window.parent.postMessage({ vc: 1, ready: true }, "*"); } catch (e) { /* 非 iframe */ }
+(function () { const c = loadDs(); if (c.key) applyDs(c, true); })();
+
 /* ---------------- 状态轮询 ---------------- */
 let STATUS = null;
 async function pollStatus() {
@@ -349,8 +338,15 @@ async function pollStatus() {
     const ready = ttsStates.filter((x) => x === "ready").length;
     $("d-tts").className = "dot " + (ready === ttsStates.length ? "ok" : ttsStates.includes("error") ? "err" : "load");
     $("t-tts").textContent = ready + "/" + ttsStates.length + " 卡" + (s.mock ? "(模拟)" : "");
-    $("d-llm").className = "dot " + (st("llm") === "ready" ? "ok" : st("llm") === "error" ? "err" : "load");
-    $("t-llm").textContent = st("llm") === "ready" ? "就绪" : st("llm") === "error" ? "失败" : "加载中";
+    if (s.deepseek) {
+      const d = s.deepseek, hasKey = d.has_key || !!loadDs().key;
+      $("d-llm").className = "dot " + (d.state === "error" ? "err" : hasKey ? "ok" : "load");
+      $("t-llm").textContent = d.state === "error" ? "Key 失败" : hasKey ? "DeepSeek 就绪" : "待填 Key";
+      $("t-ds").textContent = hasKey ? (d.model || "已填写") : "未填 Key";
+    } else {
+      $("d-llm").className = "dot " + (st("llm") === "ready" ? "ok" : st("llm") === "error" ? "err" : "load");
+      $("t-llm").textContent = st("llm") === "ready" ? "就绪" : st("llm") === "error" ? "失败" : "加载中";
+    }
     [0, 1].forEach((i) => {
       const g = (s.gpus || []).find((x) => x.index === i), el = $("g" + i);
       if (g) { el.querySelector("i").style.width = Math.round((g.mem_used / g.mem_total) * 100) + "%"; el.querySelector("span").textContent = (g.mem_used / 1024).toFixed(1) + "G " + g.util + "%"; }
@@ -543,7 +539,7 @@ async function pollJob() {
         $("ring").style.setProperty("--p", sim != null ? Math.min(100, sim * 100) : 0);
         $("ringv").textContent = sim != null ? (sim * 100).toFixed(1) + "%" : "—";
         $("rmode").textContent = "训练完成 · 模式 " + (j.mode === "icl" ? "ICL 上下文克隆" : "x-vector 声纹克隆");
-        $("rinfo").textContent = "说话人嵌入相似度 · 文本:" + (j.ref_text || "").slice(0, 28);
+        $("rinfo").textContent = "实测说话人相似度(WavLM 声纹余弦,真实测量非估算)" + (sim == null ? "" : sim >= 0.95 ? " · ✅ 已达 95% 目标" : " · 未达 95% 目标(" + (sim * 100).toFixed(1) + "%):请在安静环境录 15~25 秒清晰、情绪平稳的朗读(歌声/带伴奏的素材会明显拉低相似度),并重新训练") + " · 文本:" + (j.ref_text || "").slice(0, 28);
         toast("声音训练完成,可以开始对话了");
         if (!$("reftext").value) $("reftext").value = j.ref_text || "";
         pollStatus();
@@ -562,7 +558,7 @@ const SID = (() => {
   if (!s) { s = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : (Math.random().toString(36).slice(2) + Date.now().toString(36)); try { localStorage.setItem("vc_sid", s); } catch (e) {} }
   return s;
 })();
-let tSend = 0, curBubble = null, autoPlay = true, longMode = false, fillerOn = true, runId = 0, connFail = 0;
+let tSend = 0, curBubble = null, autoPlay = true, longMode = false, fillerOn = false, runId = 0, connFail = 0;
 function setConn(ok) {
   connFail = ok ? 0 : connFail + 1;
   const d = $("d-conn"); if (!d) return;
@@ -608,6 +604,9 @@ function handleEvent(m, bubble) {
     if (autoPlay) player.push(m.turn, m.idx, m.sr, b64ToF32(m.b64));
   } else if (m.type === "start") { player.ensure(); player.newTurn(m.turn); player.fillerFirst = !!m.filler; }
   else if (m.type === "text") { bubble.textContent += m.delta; scrollDown(); }
+  else if (m.type === "plan") player.plan(m.est_s, !!m.final);
+  else if (m.type === "think") { $("pstate").textContent = "DeepSeek 思考中…"; }
+  else if (m.type === "cont") toast("长文本自动续写第 " + m.round + " 段", 2500);
   else if (m.type === "notice") addMsg("s", m.text);
   else if (m.type === "warn") toast(m.text, 4000);
   else if (m.type === "error") { player.finish(player.expect + player.pending.size); addMsg("e", "⚠ " + m.text); }
@@ -615,7 +614,7 @@ function handleEvent(m, bubble) {
     player.finish(m.stats.chunks);
     const g = m.stats.gpu_chunks || {}; const gs = Object.keys(g).sort().map((k) => k.toUpperCase() + "×" + g[k]).join(" ");
     $("ttfa").title = "服务端首声 " + m.stats.ttfa_ms + "ms · LLM首字 " + m.stats.llm_first_ms + "ms · " + gs;
-    if (m.stats.chunks) addMsg("s", `音频 ${m.stats.audio_s}s · 首声 ${((m.stats.ttfa_ms || 0) / 1000).toFixed(2)}s · 正文首声 ${((m.stats.body_ttfa_ms || 0) / 1000).toFixed(2)}s · ${gs}${player.underruns ? " · 自适应缓冲已调整" : ""}`);
+    if (m.stats.chunks) addMsg("s", `音频 ${m.stats.audio_s}s · 首声 ${((m.stats.ttfa_ms || 0) / 1000).toFixed(2)}s · 正文首声 ${((m.stats.body_ttfa_ms || 0) / 1000).toFixed(2)}s · ${gs}· 预缓冲 ${player.prebufferS.toFixed(1)}s${player.underruns ? " · 断流" + player.underruns + "次(已自适应加大缓冲)" : " · 播放零断流"}`);
   } else if (m.type === "stopped") { player.stop(); }
 }
 
@@ -623,7 +622,7 @@ async function doChat(text, speak) {
   const my = ++runId;
   const bubble = curBubble = addMsg("a live", ""); tSend = performance.now();
   let tid;
-  try { tid = (await postRetry("/api/chat", { sid: SID, text, speak: !!speak, opts: { long: longMode, breath: $("breath").value / 100, filler: fillerOn } })).tid; }
+  try { tid = (await postRetry("/api/chat", { sid: SID, text, speak: !!speak, opts: { long: longMode, breath: $("breath").value / 100, filler: fillerOn, ds: dsCfg() } })).tid; }
   catch (e) { if (my === runId) { endBubble(); addMsg("e", "⚠ 发送失败:" + e.message); } return; }
   let after = 0, fails = 0, lastAct = performance.now();
   while (my === runId) {
@@ -664,7 +663,7 @@ document.addEventListener("keydown", (e) => { if (e.key === "Escape") $("stop").
 $("stop").onclick = () => { runId++; send({ type: "stop" }); player.stop(); endBubble(); };
 $("reset").onclick = () => { runId++; send({ type: "reset" }); player.stop(); endBubble(); $("msgs").innerHTML = ""; addMsg("s", "已开始新对话"); };
 const tgl = (id, cb) => { const e = $(id); e.onclick = (ev) => { if (ev.target.tagName === "INPUT") return; e.classList.toggle("on"); cb(e.classList.contains("on")); }; };
-tgl("tgAuto", (v) => { autoPlay = v; if (!v) player.stop(); }); tgl("tgLong", (v) => (longMode = v)); tgl("tgSmooth", (v) => (player.floor = v ? 1.2 : 0)); tgl("tgFiller", (v) => (fillerOn = v));
+tgl("tgAuto", (v) => { autoPlay = v; if (!v) player.stop(); }); tgl("tgLong", (v) => (longMode = v)); tgl("tgSmooth", (v) => (player.smooth = v)); tgl("tgFiller", (v) => (fillerOn = v));
 
 /* ---------------- 语音输入(自动断句) ---------------- */
 let micRec = null, micStream = null, micAC = null, micRAF = 0;
