@@ -118,6 +118,14 @@ def install_deps():
         log("✓ faster-qwen3-tts 可用(CUDA Graph 流式)")
     else:
         log("faster-qwen3-tts 不可用,将使用官方 qwen-tts:", (chk.stderr.strip().splitlines() or ["?"])[-1])
+    # v8: 人声分离(参考音频是歌曲/带伴奏时用)。独立于 MARK,失败不影响主流程;-c 约束文件保证不会升级/降级 torch。
+    if subprocess.run([sys.executable, "-c", "import demucs"], capture_output=True).returncode != 0:
+        log("安装 demucs(参考音频人声分离,约 1 分钟)…")
+        sh("pip install -q -c %s demucs" % c, check=False)
+    if subprocess.run([sys.executable, "-c", "import demucs"], capture_output=True).returncode == 0:
+        log("✓ demucs 可用(歌曲参考音频将自动分离人声)")
+    else:
+        log("⚠ demucs 不可用:歌曲参考音频将不做人声分离(不影响其它功能)")
     if not shutil.which("sox"):  # 只是消除 'SoX could not be found' 警告,失败不影响使用
         sh("(apt-get install -y -qq sox libsox-fmt-all > /dev/null 2>&1) || true", check=False)
     if not shutil.which("ffmpeg"):
