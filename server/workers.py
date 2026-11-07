@@ -94,12 +94,19 @@ class MockLLM:
         )
         if "__LLM_FAIL__" in last:
             raise RuntimeError("模拟的 LLM 故障(用于验证错误必定回显,不会静默卡死)")
-        for i in range(0, len(reply), 2):
-            if cancelled():
-                break
-            time.sleep(0.03)
-            emit(reply[i : i + 2])
-        return {"text": reply}
+        rounds = 3 if "__LLM_LONG__" in last else 1   # 模拟「一轮 token 用完 → 自动续写」
+        out = []
+        for r in range(rounds):
+            part = reply if r == 0 else "第%d段续写内容,衔接上文继续展开,语气保持自然连贯。" % (r + 1)
+            if r:
+                emit(config.LLM_CONT_MARK + str(r + 1))
+            for i in range(0, len(part), 2):
+                if cancelled():
+                    break
+                time.sleep(0.03)
+                emit(part[i : i + 2])
+                out.append(part[i : i + 2])
+        return {"text": "".join(out) if rounds > 1 else reply}
 
 
 class MockAux:
@@ -369,14 +376,17 @@ class RealLLM:
     def _run_once(self, kw, streamer, cancelled, emit):
         import queue
 
-        err = {}
+        err, meta = {}, {}
+        in_len = int(kw["input_ids"].shape[1])
 
         def run():
             import torch
 
             try:
                 with torch.inference_mode():
-                    self.model.generate(**kw)
+                    ids = self.model.generate(**kw)
+                meta["n"] = int(ids.shape[1]) - in_len
+                meta["last"] = int(ids[0, -1])
             except BaseException as e:  # noqa: BLE001  必须捕获,否则 streamer 永远等不到结束信号 → 界面「没反应」
                 err["e"] = e
                 err["tb"] = traceback.format_exc()
@@ -415,50 +425,97 @@ class RealLLM:
             kw["stopping_criteria"][0].force = True
             raise RuntimeError("LLM 超过 %d 秒没有输出(可能显存不足或模型卡死)" % int(config.LLM_STALL_TIMEOUT))
         th.join(timeout=5)
-        return pieces, err, head
+        return pieces, err, head, meta
+
+    def _eos_ids(self):
+        eos = getattr(self.model.generation_config, "eos_token_id", None)
+        if eos is None:
+            eos = self.tok.eos_token_id
+        return set(eos if isinstance(eos, (list, tuple)) else [eos])
 
     def chat(self, args, emit, cancelled):
+        """长文本输出:一轮 generate 撞到 token 上限而没有自然结束时,把已生成的文字接在提示词后面自动续写,
+        一直到模型自己说完或总预算用完。对前端/播放完全透明(文字流不中断)。"""
         import torch
         from transformers import StoppingCriteria, StoppingCriteriaList, TextIteratorStreamer
 
         msgs = args["messages"]
+        budget = int(args.get("max_new_tokens", config.LLM_DEFAULT_TOKENS))
         try:
-            prompt = self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+            base = self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
         except TypeError:
-            prompt = self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-        inputs = self.tok([prompt], return_tensors="pt").to(self.dev)
+            base = self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        pacer = Pacer(config.LLM_PACE_TPS, config.LLM_PACE_BURST)
 
         class Cancel(StoppingCriteria):
             force = False
 
             def __call__(self, input_ids, scores, **kw):
+                pacer.tick()  # 每个 token 一次:首批之后限速,避免和 TTS 抢 GPU
                 return torch.full((input_ids.shape[0],), bool(cancelled() or self.force), dtype=torch.bool, device=input_ids.device)
 
-        for attempt in (0, 1):
-            streamer = TextIteratorStreamer(
-                self.tok, skip_prompt=True, skip_special_tokens=True, timeout=config.LLM_FIRST_TOKEN_TIMEOUT
-            )
-            kw = dict(
-                **inputs,
-                streamer=streamer,
-                max_new_tokens=int(args.get("max_new_tokens", config.LLM_DEFAULT_TOKENS)),
-                do_sample=True,
-                temperature=0.7,
-                top_p=0.8,
-                top_k=20,
-                repetition_penalty=1.05,
-                stopping_criteria=StoppingCriteriaList([Cancel()]),
-            )
-            pieces, err, head = self._run_once(kw, streamer, cancelled, emit)
-            garbage = self.dtype_name == "float16" and head.startswith("!!!!")
-            if (err or garbage) and not pieces_ok(pieces, garbage) and attempt == 0 and self.dtype_name == "float16":
-                print("[llm] fp16 生成失败/输出异常,换 bfloat16 重试: %s" % (err.get("tb") or head), flush=True)
-                self._to_bf16()
-                continue
-            if err:
-                raise RuntimeError("LLM 生成失败: %s" % (str(err["e"]).strip().splitlines() or [repr(err["e"])])[-1])
-            return {"text": "".join(pieces)}
-        raise RuntimeError("LLM 生成失败")
+        text_all, used, rnd = [], 0, 0
+        while True:
+            rnd += 1
+            n_new = min(config.LLM_ROUND_TOKENS, budget - used)
+            if n_new <= 0:
+                break
+            inputs = self.tok([base + "".join(text_all)], return_tensors="pt").to(self.dev)
+            pieces, meta = [], {}
+            for attempt in (0, 1):
+                streamer = TextIteratorStreamer(
+                    self.tok, skip_prompt=True, skip_special_tokens=True, timeout=config.LLM_FIRST_TOKEN_TIMEOUT
+                )
+                kw = dict(
+                    **inputs,
+                    streamer=streamer,
+                    max_new_tokens=n_new,
+                    do_sample=True,
+                    temperature=0.7,
+                    top_p=0.8,
+                    top_k=20,
+                    repetition_penalty=1.05,
+                    stopping_criteria=StoppingCriteriaList([Cancel()]),
+                )
+                pieces, err, head, meta = self._run_once(kw, streamer, cancelled, emit)
+                garbage = self.dtype_name == "float16" and head.startswith("!!!!")
+                if (err or garbage) and not pieces_ok(pieces, garbage) and attempt == 0 and self.dtype_name == "float16":
+                    print("[llm] fp16 生成失败/输出异常,换 bfloat16 重试: %s" % (err.get("tb") or head), flush=True)
+                    self._to_bf16()
+                    continue
+                if err:
+                    raise RuntimeError("LLM 生成失败: %s" % (str(err["e"]).strip().splitlines() or [repr(err["e"])])[-1])
+                break
+            text_all.extend(pieces)
+            used += int(meta.get("n", n_new))
+            hit_limit = meta.get("n", 0) >= n_new and meta.get("last") not in self._eos_ids()
+            if cancelled() or not hit_limit or not pieces:
+                break
+            if used >= budget:
+                break
+            emit(CONT_MARK + str(rnd + 1))
+        return {"text": "".join(text_all), "rounds": rnd, "tokens": used}
+
+
+CONT_MARK = config.LLM_CONT_MARK
+
+
+class Pacer:
+    """令牌桶限速:前 burst 个 token 不限,之后每秒最多 tps 个。tps<=0 关闭。"""
+
+    def __init__(self, tps: float, burst: int):
+        self.tps, self.burst, self.n, self.nxt = tps, burst, 0, None
+
+    def tick(self):
+        self.n += 1
+        if self.tps <= 0 or self.n <= self.burst:
+            return
+        now = time.time()
+        if self.nxt is None:
+            self.nxt = now
+        if self.nxt > now:
+            time.sleep(min(self.nxt - now, 0.5))
+        self.nxt = max(self.nxt, now) + 1.0 / self.tps
 
 
 def pieces_ok(pieces, garbage):
