@@ -73,7 +73,7 @@ class MockTTS:
         for i in range(0, len(wav), step):
             if cancelled():
                 break
-            time.sleep(0.05)  # 模拟 RTF≈6
+            time.sleep(float(os.environ.get("MOCK_CHUNK_SLEEP", "0.05")))  # 模拟合成速度(默认 RTF≈0.15;MOCK_CHUNK_SLEEP=0.3 → 单卡 RTF≈0.9)
             emit({"pcm": wav[i : i + step], "sr": config.SR})
             total += min(step, len(wav) - i)
         return {"samples": total, "sr": config.SR}
