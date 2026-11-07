@@ -8,6 +8,7 @@
 """
 import asyncio
 import json
+import os
 from pathlib import Path
 from contextlib import asynccontextmanager
 
@@ -24,10 +25,50 @@ diag.install()  # 把服务端日志同时复制进检测日志缓冲(输出框�
 engine = Engine()
 
 
+# ---------------------------------------------------------------- v10: 连接稳定性
+# 1) /api/state 把 ping + status + job 合并成一个「永不等待」的请求:返回后台每 0.4 秒刷新的快照,
+#    即使 nvidia-smi / 线程池 / 训练任务很忙,浏览器也能在一个 RTT 内拿到答案。
+# 2) 事件循环延迟监控(lag_ms):以后日志里一看就知道「慢」是服务端阻塞还是公网隧道的问题。
+# 3) 备用线路:kaggle/run.py 把所有公网地址写进 TUNNEL_FILE,页面/模拟器据此在主线路卡死时自动切换。
+TUNNEL_FILE = Path(os.environ.get("CLONE_TUNNEL_FILE", "/tmp/clone_tunnels.json"))
+_SNAP = {"t": 0.0, "v": None}
+_LAG = {"ms": 0.0, "max": 0.0}
+
+
+def _tunnels() -> dict:
+    try:
+        return json.loads(TUNNEL_FILE.read_text("utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+async def _snapshot_loop():
+    while True:
+        try:
+            _SNAP["v"] = await asyncio.wait_for(asyncio.to_thread(engine.status), 10)
+            _SNAP["t"] = time.time()
+        except Exception:  # noqa: BLE001
+            pass
+        await asyncio.sleep(0.4)
+
+
+async def _lag_loop():
+    loop = asyncio.get_running_loop()
+    while True:
+        t = loop.time()
+        await asyncio.sleep(0.25)
+        lag = max(0.0, (loop.time() - t - 0.25) * 1000)
+        _LAG["ms"] = lag
+        _LAG["max"] = max(_LAG["max"] * 0.99, lag)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await engine.start()
+    bg = [asyncio.create_task(_snapshot_loop()), asyncio.create_task(_lag_loop())]
     yield
+    for t in bg:
+        t.cancel()
     for w in engine.workers:
         w.stop()
 
@@ -53,6 +94,12 @@ async def index():
     return FileResponse(config.WEB_DIR / "index.html", media_type="text/html; charset=utf-8")
 
 
+@app.get("/link.js")
+async def link_js():
+    """v10: 连接层(稳定连接 + 备用线路自动切换)。独立成文件,方便用 Node 离线仿真测试。"""
+    return FileResponse(config.WEB_DIR / "link.js", media_type="application/javascript; charset=utf-8")
+
+
 @app.get("/player.js")
 async def player_js():
     """无缝播放器(自适应预缓冲)。独立成文件,方便用 Node 离线仿真测试。"""
@@ -73,12 +120,27 @@ async def health():
 @app.get("/api/ping")
 async def ping():
     # 极轻量(浏览器模拟器每 3 秒探测一次):时间戳 + 当前运行的代码版本 + 对话模型(本地 LLM)状态
-    return {"t": time.time(), "code_version": config.CODE_VERSION, "llm": engine.llm.state if engine.llm else "none"}
+    tun = _tunnels()
+    return {"t": time.time(), "code_version": config.CODE_VERSION, "llm": engine.llm.state if engine.llm else "none",
+            "lag_ms": round(_LAG["ms"], 1), "lag_max_ms": round(_LAG["max"], 1), "alts": tun.get("urls", []), "primary": tun.get("primary")}
+
+
+@app.get("/api/state")
+async def state():
+    """v10: 页面唯一的状态轮询接口(心跳 + 状态 + 训练任务),立即返回缓存快照,不会排队。"""
+    s = _SNAP["v"]
+    if s is None:
+        s = await asyncio.to_thread(engine.status)
+    tun = _tunnels()
+    return {"t": time.time(), "code_version": config.CODE_VERSION, "llm": engine.llm.state if engine.llm else "none",
+            "lag_ms": round(_LAG["ms"], 1), "lag_max_ms": round(_LAG["max"], 1),
+            "snap_age_ms": int((time.time() - _SNAP["t"]) * 1000) if _SNAP["t"] else None,
+            "alts": tun.get("urls", []), "primary": tun.get("primary"), "status": s}
 
 
 @app.get("/api/status")
 async def status():
-    return await asyncio.to_thread(engine.status)
+    return await asyncio.to_thread(engine.status)   # 实时现算(自检/脚本用);页面走 /api/state
 
 
 @app.post("/api/reload")
