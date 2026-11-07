@@ -14,7 +14,7 @@ import uuid
 import numpy as np
 
 from . import audio_utils as au
-from . import config, perf
+from . import config, perf, vocals
 from . import deepseek as ds
 from .errors import NumericError, is_numeric_error, next_dtype
 from .text_chunker import SentenceChunker, clean_for_tts, detect_language, is_speakable
@@ -524,7 +524,7 @@ class Engine:
             del tl[:-30]
         self.job.update(kw)
 
-    async def start_training(self, audio: bytes, ref_text: str, lang: str = "zh"):
+    async def start_training(self, audio: bytes, ref_text: str, lang: str = "zh", song: bool = False):
         if self.job.get("state") == "running" and time.time() - self.job.get("started", 0) < config.TRAIN_MAX_SECONDS:
             raise RuntimeError("训练正在进行中(已 %d 秒,请看下面的进度;超过 %d 秒仍无进展会自动允许重新开始)" % (time.time() - self.job.get("started", 0), config.TRAIN_MAX_SECONDS))
         old = getattr(self, "_train_task", None)
@@ -536,7 +536,7 @@ class Engine:
             "gpus": [{"gpu": w.gpu, "progress": 0, "msg": "等待"} for w in self.tts[:n]],
             "similarity": None, "quality": None, "started": time.time(),
         }
-        self._train_task = asyncio.create_task(self._train(audio, ref_text.strip(), lang))  # 持有强引用,防止任务被垃圾回收
+        self._train_task = asyncio.create_task(self._train(audio, ref_text.strip(), lang, song))  # 持有强引用,防止任务被垃圾回收
 
     def _gpu_msg(self, i, progress, msg):
         gs = self.job.get("gpus", [])
@@ -566,14 +566,14 @@ class Engine:
             self._log("⚠ 语音识别失败,本次只用 x-vector 模式: %s" % (str(e).strip().splitlines() or ["?"])[-1])
             return ""
 
-    async def _train(self, audio: bytes, ref_text: str, lang_hint: str = "zh"):
+    async def _train(self, audio: bytes, ref_text: str, lang_hint: str = "zh", song: bool = False):
         """训练入口:真正的流水线在 _train_inner。TTS 出现数值异常(float16 在 T4 上采样出 NaN 的已知问题)时,
         自动重启 TTS 进程、换更稳的精度(bfloat16 → float32),然后自动重试 —— 用户不需要做任何事。"""
         retries = 0
         try:
             while True:
                 try:
-                    await self._train_inner(audio, ref_text, lang_hint)
+                    await self._train_inner(audio, ref_text, lang_hint, song)
                     return
                 except asyncio.CancelledError:
                     self._set(state="error", stage="已取消", error="训练被新的训练任务取代")
@@ -598,7 +598,7 @@ class Engine:
             self._log("失败: " + msg)
             print(e, flush=True)
 
-    async def _train_inner(self, audio: bytes, ref_text: str, lang_hint: str = "zh"):
+    async def _train_inner(self, audio: bytes, ref_text: str, lang_hint: str = "zh", song: bool = False):
         """加速版流水线: 两张卡从第一秒起就同时干活。
         GPU0: 提取 x-vector 声纹 → 合成校验句 → 相似度;   aux(GPU1): Whisper 识别文本
         GPU1: (等文本) 提取 ICL 上下文 → 合成校验句 → 相似度;   最后把胜出的模式补到另一张卡。
@@ -624,6 +624,18 @@ class Engine:
             x = await asyncio.to_thread(au.decode_audio, audio, config.SR)
         if x.size < config.SR * 1.5:
             raise ValueError("参考音频太短(<1.5s),请至少录制 5 秒以上")
+        # 1.5 人声分离:歌曲/带伴奏/信噪比低 → 先抠出干净人声(失败自动沿用原音频)
+        q0 = au.analyze_quality(x, config.SR)
+        if vocals.should_run(q0["snr_db"], song):
+            self._set(stage="人声分离(去伴奏/背景音乐)", progress=10)
+            self._log("参考音频%s,信噪比≈%.0fdB,先做人声分离" % ("是歌曲/带伴奏(用户标记)" if song else "噪声偏大", q0["snr_db"]))
+            with perf.span("gpu1/vocal_separation"):
+                xv = await asyncio.to_thread(vocals.separate, x, config.SR)
+            if xv is not None:
+                x = xv
+                self._log("✓ 人声分离完成,信噪比≈%.0fdB" % au.analyze_quality(x, config.SR)["snr_db"])
+            else:
+                self._log("⚠ 人声分离不可用/失败,沿用原音频(可 pip install demucs)")
         with perf.span("cpu/preprocess_reference"):
             ref, quality, warns = await asyncio.to_thread(au.preprocess_reference, x, config.SR)
         self._set(quality=quality, warnings=warns)
@@ -873,7 +885,7 @@ class Engine:
             push_json(obj)
 
         async def emit_audio(turn, idx, sr, pcm):
-            log.push({"type": "audio", "turn": turn, "idx": idx, "sr": sr, "b64": base64.b64encode(pcm).decode("ascii")})
+            log.push({"type": "audio", "turn": turn, "idx": idx, "sr": sr, "pcm": pcm})
 
         async def guarded():
             try:
@@ -908,9 +920,36 @@ class Engine:
                 break
         if len(log.events) > after and not log.done and len(log.events) - after < 3:
             await asyncio.sleep(0.02)  # 合并相邻事件,减少请求数
-        evs = log.events[after:after + 200]
+        evs = [wire_json(e) for e in log.events[after:after + 200]]
         nxt = after + len(evs)
         return {"events": evs, "next": nxt, "done": log.done and nxt >= len(log.events)}
+
+    async def stream_events(self, sid: str, tid: int, after: int = 0):
+        """v8: 逐帧推送一轮对话的事件(二进制帧,见 frame_*)。连接断开不影响服务端生成,客户端用游标回退到 /api/events。"""
+        sess = self.get_session(sid)
+        log = sess.log
+        if log is None or log.tid != tid:
+            yield frame_ctl(K_END, {"superseded": True})
+            return
+        i = after
+        loop = asyncio.get_running_loop()
+        while True:
+            while i < len(log.events):
+                yield frame_event(log.events[i])
+                i += 1
+            if log.done:
+                break
+            log.ev.clear()
+            if i < len(log.events) or log.done:
+                continue
+            try:
+                await asyncio.wait_for(log.ev.wait(), config.STREAM_HEARTBEAT)
+            except asyncio.TimeoutError:
+                yield frame_ctl(K_BEAT, {"t": round(loop.time(), 1)})
+        while i < len(log.events):
+            yield frame_event(log.events[i])
+            i += 1
+        yield frame_ctl(K_END, {"n": i})
 
     def stop_chat(self, sid: str):
         sess = self.get_session(sid)
@@ -1135,6 +1174,31 @@ def _split_all(text: str):
     out = c.feed(text)
     out += c.flush()
     return out
+
+
+# ---- v8 流式帧:[1B 类型][4B 长度(大端)][负载] ----
+K_JSON, K_AUDIO, K_HELLO, K_BEAT, K_END = 0, 1, 2, 3, 4
+
+
+def _frame(kind: int, payload: bytes) -> bytes:
+    return struct.pack(">BI", kind, len(payload)) + payload
+
+
+def frame_ctl(kind: int, obj: dict) -> bytes:
+    return _frame(kind, json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+
+
+def frame_event(ev: dict) -> bytes:
+    if ev.get("type") == "audio" and "pcm" in ev:  # 音频:12 字节头(turn, idx, sr; 大端 u32)+ 原始 PCM16,没有 base64
+        return _frame(K_AUDIO, struct.pack(">III", ev["turn"], ev["idx"], ev["sr"]) + ev["pcm"])
+    return _frame(K_JSON, json.dumps(ev, ensure_ascii=False).encode("utf-8"))
+
+
+def wire_json(ev: dict) -> dict:
+    """长轮询通道(/api/events)需要 JSON:把原始 PCM 转成 base64。"""
+    if ev.get("type") == "audio" and "pcm" in ev:
+        return {"type": "audio", "turn": ev["turn"], "idx": ev["idx"], "sr": ev["sr"], "b64": base64.b64encode(ev["pcm"]).decode("ascii")}
+    return ev
 
 
 def pack_audio(turn: int, idx: int, sr: int, pcm: bytes) -> bytes:
