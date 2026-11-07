@@ -1,4 +1,12 @@
-/* 无缝播放器 v7 —— 自适应预缓冲 + 采样级拼接。
+/* 无缝播放器 v8 —— 弹性变速(WSOLA,变速不变调) + 自适应预缓冲 + 采样级拼接。
+ *
+ * v8 相对 v7 的根本改变(批判:v7 把「不断流」完全押在预缓冲上,合成速率≈实时就要先等 10 秒以上,实测首声 19.2s):
+ *   不断流只要求「消耗速度 ≤ 生产速度」。v8 在缓冲不足时把消耗速度 q 轻微降到 [0.87, 1](音高/音色不变,见 wsola.js),
+ *   缓冲充足就回到 1.0(此时逐采样精确重建,无任何处理痕迹)。
+ *   所需预缓冲由 B ≥ E_rem·(1/r − 1) 降为 B ≥ E_rem·(q_min/r − 1):r≥0.87 时不再需要预缓冲 → 第一块到达即开播。
+ *   r<0.87(真的太慢)才回退到预缓冲;真缓冲见底仍只暂停一次并加大余量(v7 逻辑保留)。
+ *
+ * v7 说明:
  *
  * 为什么以前会「播放-停止-播放-停止」?
  *   旧版一旦缓冲耗尽就只多等 0.7 秒再播,而合成速度如果低于播放速度(RTF>1),
@@ -15,6 +23,7 @@
  */
 (function (root) {
   "use strict";
+  const WsolaCls = root.Wsola || (typeof require !== "undefined" ? require("./wsola.js") : null);
 
   class GaplessPlayer {
     constructor(opts) {
@@ -25,8 +34,11 @@
       this.clearTimer = opts.clearInterval || function (h) { return root.clearInterval(h); };
       this.ctx = null;
       this.smooth = true;          // 「无停顿优先」开关
-      this.minStart = 0.5;         // 最小起播缓冲(秒)
-      this.margin = 0.35;          // 抖动余量(句间衔接、网络长轮询的批量到达)
+      this.minStart = 0.45;        // 最小起播缓冲(秒)
+      this.margin = 0.3;           // 抖动余量(句间衔接、网络抖动)
+      this.stretch = !!WsolaCls;   // 弹性变速开关(缓冲不足时轻微放慢,音高不变)
+      this.qMin = 0.87;            // 最慢播放速度(再慢就改用预缓冲)
+      this.prior = 0.95;           // 合成速率先验(秒音频/秒墙钟),前 1~2 秒用它与实测加权
       this.cap = 14;               // 预缓冲上限(秒):再多就让用户等太久
       this.maxWait = 16;           // 最长等待(秒)后无论如何开播
       this.boost = 0;              // 发生过真正断流后永久增加的余量
@@ -73,6 +85,11 @@
       this.firstDone = false;
       this.prebufferS = 0;
       this.state = "idle";
+      this.stretcher = null;
+      this.q = 1;
+      this.flushed = false;
+      this.qMinUsed = 1;
+      this.firstArriveAt = 0;
     }
 
     newTurn(turn) { this.stop(); this.turn = turn; }
@@ -93,7 +110,7 @@
       const dur = f32.length / sr;
       this.pending.set(idx, { sr: sr, f32: f32, dur: dur });
       const now = this.clock();
-      if (!this.firstArrive) { this.firstArrive = now; this.firstDur = dur; }
+      if (!this.firstArrive) { this.firstArrive = now; this.firstDur = dur; this.firstArriveAt = now * 1000; }
       else if (now - this.lastArrive > this.maxGap) this.maxGap = Math.min(4, now - this.lastArrive);
       this.lastArrive = now;
       this.arrivedS += dur;
@@ -103,26 +120,45 @@
     /* ---------- 度量 ---------- */
     contiguousS() { let d = 0, i = this.expect; while (this.pending.has(i)) { d += this.pending.get(i).dur; i++; } return d; }
     rate() {
-      // 生产速率:不含第一块(它到达的瞬间还没有「经过的时间」)
-      const el = this.clock() - this.firstArrive;
-      if (!this.firstArrive || el < 0.3) return 1.0;
-      return Math.max(0.15, (this.arrivedS - this.firstDur) / el);
+      // 生产速率:不含第一块(它到达的瞬间还没有「经过的时间」);前期与先验加权,避免「刚到第一块 → 速率=1.0」的乐观误判
+      if (!this.firstArrive) return this.prior;
+      const el = Math.max(0, this.clock() - this.firstArrive), w = 1.2;
+      return Math.max(0.15, (this.prior * w + (this.arrivedS - this.firstDur)) / (w + el));
+    }
+    stretchOn() { return this.stretch && this.smooth && !!WsolaCls; }
+    pendingS() { let d = 0; for (const c of this.pending.values()) d += c.dur; return d; }
+    eRemS() {   // 预计还没生产出来的音频秒数
+      const known = this.total !== null || this.planFinal;
+      let e = Math.max(0, this.estTotal - this.arrivedS) * 1.15;
+      if (!known) e += Math.min(20, Math.max(2, 0.3 * this.estTotal));
+      return e;
     }
     allArrived() { return this.total !== null && this.expect + this.pending.size >= this.total; }
     needS() {
       if (!this.smooth) return 0.2;
       if (this.allArrived()) return 0;
-      const r = this.rate() * 0.85;   // 15% 安全系数:句间衔接/调度抖动会让「后面」的实际速率比「已观测」的低
-      // 还没生产出的音频:服务端预计总时长 − 已到达;文本还没流完(没有 final)时再加一段未知尾巴
-      const known = this.total !== null || this.planFinal;
-      let eRem = Math.max(0, this.estTotal - this.arrivedS) * 1.15;
-      if (!known) eRem += Math.min(20, Math.max(2, 0.3 * this.estTotal));
+      const r = this.rate() * 0.9;    // 10% 安全系数:句间衔接/调度抖动会让「后面」的实际速率比「已观测」的低
+      const qf = this.stretchOn() ? this.qMin : 1;   // 能放慢到 qMin,所以只需补足 qMin 与 r 之间的差
+      const eRem = this.eRemS();
       let need = this.minStart + this.boost;
-      if (r < 1.0 && eRem > 0) need = Math.max(need, eRem * (1 / r - 1) + this.margin + this.boost);
-      else need = Math.max(need, this.margin + this.boost);
+      if (r < qf && eRem > 0) need = Math.max(need, eRem * (qf / r - 1) + this.margin + this.boost);
       need += Math.min(2.5, this.maxGap * 1.1);          // 已观测到的最长「断料」间隔
       if (this.holdAfterStall) need = Math.max(need, this.holdAfterStall);  // 断流后的滞回:必须比上次更充裕,杜绝反复起停
       return Math.min(this.cap, need);
+    }
+    /* 本块的播放速度 q:使 (B+E_rem)/q ≥ E_rem/r(剩余音频在生产完之前不会被播完) */
+    pickQ() {
+      if (!this.stretchOn() || this.allArrived()) return 1;
+      const eRem = this.eRemS();
+      if (eRem < 0.3) return 1;
+      const r = this.rate() * 0.9;
+      const lead = this.running ? Math.max(0, this.nextTime - this.ctx.currentTime) : 0;
+      const B = lead * this.q + this.pendingS();
+      let target = r * (B + eRem) / eRem;
+      target = Math.max(this.qMin, Math.min(1, target));
+      // 限幅变化率:下降快(防断流)、回升慢(听感平滑)
+      const q = target < this.q ? Math.max(target, this.q - 0.05) : Math.min(target, this.q + 0.02);
+      return q >= 0.995 ? 1 : q;
     }
     gateOpen() {
       const b = this.contiguousS();
@@ -157,11 +193,24 @@
         this.expect++;
         this.sched(c);
       }
+      this.flushTail();
     }
     sched(c) {
+      let f32 = c.f32;
+      if (this.stretchOn()) {
+        if (!this.stretcher) this.stretcher = new WsolaCls(c.sr);
+        const q = this.pickQ();
+        this.q = q;
+        if (q < this.qMinUsed) this.qMinUsed = q;
+        f32 = this.stretcher.process(c.f32, q);
+      }
+      this.emit(f32, c.sr);
+    }
+    emit(f32, sr) {
+      if (!f32.length) return;
       const ctx = this.ctx;
-      const buf = ctx.createBuffer(1, c.f32.length, c.sr);
-      buf.copyToChannel(c.f32, 0);
+      const buf = ctx.createBuffer(1, f32.length, sr);
+      buf.copyToChannel(f32, 0);
       const src = ctx.createBufferSource();
       src.buffer = buf;
       src.connect(this.gain);
@@ -174,6 +223,11 @@
       src.onended = () => { this.srcs.delete(src); this.check(); };
       this._state("playing");
       if (!this.firstDone) { this.firstDone = true; this.onfirst(this.clock() * 1000, at - ctx.currentTime); }
+    }
+    flushTail() {   // 一轮的最后一块已全部排入 → 把变速器里残留的尾巴也播出来
+      if (this.flushed || !this.stretcher || this.total === null || this.expect < this.total) return;
+      this.flushed = true;
+      this.emit(this.stretcher.flush(), this.stretcher.sr);
     }
 
     tick() {
@@ -199,7 +253,7 @@
     }
 
     check() {
-      if (this.total !== null && this.expect >= this.total && this.srcs.size === 0) {
+      if (this.total !== null && this.expect >= this.total && this.srcs.size === 0 && (this.flushed || !this.stretcher)) {
         this.running = false;
         this._state("idle");
         if (this.underruns === 0) this.boost = Math.max(0, this.boost - 0.2);
