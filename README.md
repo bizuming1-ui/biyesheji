@@ -77,6 +77,25 @@ Qwen3-TTS 声音克隆模型在 **T4(Turing 架构,没有原生 bf16)上用 floa
 * 失败时界面直接显示真实原因和最近日志(不再只是一闪而过的提示)。
 * 自检:`CLONE_MOCK=1 python tests/e2e_numeric.py`(模拟 NaN 崩溃 → 自动降级 → 训练成功 → 对话可用)
 
+## v10 改动(连接「重连中」根因修复:请求风暴 → 串行心跳 + 双线路自动切换)
+
+### 真实数据里的根因(logs/run-log-20261107-143559.txt)
+
+`/api/ping` 失败 36/65、`/api/status` 失败 56/139、`/api/voice/job` 失败 35/68,**失败原因几乎全是前端自己的 6~8 秒超时**(`signal is aborted`),不是服务端报错。
+旧版同时跑 4 个互不等待的定时器(ping 5s / status 3s / job 0.8s / 日志面板 diag 3s),上一个请求还没回来就发下一个;在 RTT≈400ms 的 trycloudflare 隧道上形成「请求风暴」,互相拖慢 → 超时 → 指示灯判「重连中」。同时免费隧道没有 SLA,偶尔整条卡几十秒,**单线路无论怎么调参都不可能做到零断连,只能靠冗余**。
+
+### 修复
+
+* **`web/link.js`(新)连接层**:`/api/state` = ping + status + job 合并成一个请求,**串行**(上一个结束才发下一个)、超时 20s、失败指数退避(1.5s→8s);对话进行中/页面隐藏时降频(对话流本身就是心跳,不再和音频抢带宽)。
+* **指示灯只看真实连通性**:最近 25 秒内有任何一次成功(含对话流数据)= 「已连接 · 延迟」;25~60 秒 = 「网络波动·自动重连」;超过 60 秒才是「重连中」。单次超时不再改变指示灯。
+* **双线路**(`kaggle/run.py`):主线路 cloudflared(http2)+ 备用线路(pinggy / localhost.run,走 SSH)同时在线;所有地址写入 `/tmp/clone_tunnels.json`,服务端经 `/api/state` 下发。页面连续 4 次失败 → 探测备用线路 → 通即无缝切换(`fetch('/api/..')` 自动加线路前缀,服务端已开放 CORS);浏览器模拟器同样自动切换。
+* **看门狗 10 秒一次**(原 20 秒×3):主线路 / 备用线路 / uvicorn 任何一个挂了自动拉起;每 10 分钟打印一行真实统计(探测次数、失败数、均值/P95)。
+* **服务端 `/api/state` 永不排队**:后台每 0.4 秒刷新快照(nvidia-smi 等慢操作在后台线程),请求直接返回;`lag_ms` 记录事件循环延迟,以后日志能直接区分「服务端阻塞」还是「公网隧道慢」。
+* 运行日志面板自动刷新 3s → 8s 且不重叠。
+* 自检:`node tests/link_sim.js`(连接层离线仿真)、`CLONE_MOCK=1 python tests/e2e_link.py`(1000 个并发 /api/state 零失败、P95<1s,训练+对话同时进行)、`CLONE_MOCK=1 node tests/browser_link.js`(真实 Chromium:前 3 次请求失败不变红 → 主线路彻底卡死自动切备用线路)。
+
+> 说明:公网隧道本身的质量取决于 Kaggle 出口与 Cloudflare/pinggy,代码无法保证它永不抖动;v10 保证的是「抖动不会被误判为断连、不会被请求风暴放大、真卡死时自动切线、对话数据靠游标续传不丢」。
+
 ## v9 改动(对话大模型直接部署在 Kaggle,彻底移除 DeepSeek / Key)
 
 * **对话模型 = Qwen3-4B-Instruct-2507**,直接加载在 Kaggle 的两张 T4 上(fp16,按层分到两卡,每卡约 3.8GiB),不需要任何外部 API、Key、Internet 之外的账号。原生 262K 上下文,适合长文。
@@ -133,7 +152,7 @@ Qwen3-TTS 声音克隆模型在 **T4(Turing 架构,没有原生 bf16)上用 floa
 
 ```
 server/        后端 (FastAPI + 多进程 GPU worker)
-web/index.html 前端(单屏,无需滚动)
+web/index.html 前端(单屏,无需滚动) · web/link.js 连接层(v10)
 kaggle/run.py  Kaggle 启动器(装依赖/下载模型/起服务/建公网隧道/看门狗)
 tests/         Mock 端到端自检 (CLONE_MOCK=1, 不需要 GPU):e2e_mock / e2e_fail / e2e_diag / e2e_numeric / e2e_stream;JS: player_sim / wsola_test / browser_stream
 server/errors.py  数值异常识别 + 精度回退链(v5)
