@@ -111,7 +111,7 @@ def test_audio_dsp():
 def main():
     test_chunker()
     test_audio_dsp()
-    env = dict(os.environ, CLONE_MOCK="1", CLONE_DATA=str(ROOT / "data_test"))
+    env = dict(os.environ, CLONE_MOCK="1", LLM_BACKEND="local", CLONE_DATA=str(ROOT / "data_test"))
     p = subprocess.Popen([sys.executable, "-m", "uvicorn", "server.app:app", "--port", str(PORT), "--no-access-log"], cwd=ROOT, env=env)
     try:
         c = httpx.Client(base_url=BASE, timeout=30)
@@ -152,7 +152,7 @@ def main():
         check("voice registered on both cards", v and len(v.get("workers", [])) == 2, v and v.get("workers"))
         time.sleep(1.5)  # 语气词在后台生成
 
-        audio, text, last, first, evs = run_chat(c, "你好,请介绍一下你自己")
+        audio, text, last, first, evs = run_chat(c, "你好,请介绍一下你自己", opts={"filler": True})
         check("chat done", last and last["type"] == "done", last)
         idxs = [e["idx"] for e in audio]
         check("audio idx sequential", idxs == list(range(len(idxs))) and len(idxs) >= 3, idxs[:20])
