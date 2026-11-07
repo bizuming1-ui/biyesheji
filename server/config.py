@@ -2,7 +2,7 @@
 import os
 from pathlib import Path
 
-CODE_VERSION = "v7"  # 浏览器模拟器的「检测日志」会读取它,用来判断 Kaggle 上跑的是不是最新代码
+CODE_VERSION = "v8"  # 浏览器模拟器的「检测日志」会读取它,用来判断 Kaggle 上跑的是不是最新代码
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("CLONE_DATA", ROOT / "data"))
@@ -76,3 +76,14 @@ TRAIN_SYNTH_STALL = float(os.environ.get("TRAIN_SYNTH_STALL", "240"))  # 训练�
 TRAIN_CHUNK = int(os.environ.get("TRAIN_CHUNK", "16"))              # 训练校验句用更大的流式块 → 更少的解码调用 → 更快
 TRAIN_MAX_SECONDS = float(os.environ.get("TRAIN_MAX_SECONDS", "900"))  # 超过这个时间的训练任务视为卡死,可被新训练取代
 TRAIN_ASR_WAIT = float(os.environ.get("TRAIN_ASR_WAIT", "90"))      # 自动识别参考文本最多等 Whisper 就绪多少秒
+
+
+# ---- v8: 参考音频人声分离(歌曲/伴奏) ----
+REF_SEPARATE = os.environ.get("REF_SEPARATE", "auto").lower()          # auto: 信噪比低或用户勾选「歌曲」时分离; 1: 总是; 0: 关闭
+REF_SEPARATE_SNR = float(os.environ.get("REF_SEPARATE_SNR", "30"))      # auto 模式:信噪比低于此值(dB)就分离
+REF_SEPARATE_DEVICE = os.environ.get("REF_SEPARATE_DEVICE", "cuda")     # cuda / cpu
+REF_SEPARATE_GPU = os.environ.get("REF_SEPARATE_GPU", "1")              # 用哪张卡跑分离(GPU1 上只有 Whisper,比较空)
+REF_SEPARATE_TIMEOUT = float(os.environ.get("REF_SEPARATE_TIMEOUT", "120"))
+
+# ---- v8: 对话流式通道(单个 HTTP 响应推送二进制帧,无 base64、无轮询间隙) ----
+STREAM_HEARTBEAT = float(os.environ.get("STREAM_HEARTBEAT", "4"))
