@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 
 import time
 
-from . import config, diag, perf, uploads
+from . import config, deepseek, diag, perf, uploads
 from .engine import Engine, pack_audio
 
 diag.install()  # 把服务端日志同时复制进检测日志缓冲(输出框照常显示)
@@ -53,6 +53,27 @@ async def index():
     return FileResponse(config.WEB_DIR / "index.html", media_type="text/html; charset=utf-8")
 
 
+@app.get("/player.js")
+async def player_js():
+    """无缝播放器(自适应预缓冲)。独立成文件,方便用 Node 离线仿真测试。"""
+    return FileResponse(config.WEB_DIR / "player.js", media_type="application/javascript; charset=utf-8")
+
+
+@app.get("/api/deepseek")
+async def deepseek_state():
+    return engine.ds_public()
+
+
+@app.post("/api/deepseek")
+async def deepseek_set(request: Request):
+    """填写/更换 DeepSeek Key:校验 + 预热连接 + 返回账户可用模型。Key 只放内存,响应里只有末 4 位。"""
+    body = await request.json()
+    try:
+        return {"ok": True, **await engine.ds_configure(str(body.get("key") or ""), str(body.get("model") or ""), bool(body.get("thinking")))}
+    except deepseek.DeepSeekError as e:
+        return JSONResponse({"ok": False, "error": str(e), "status": e.status}, status_code=200)
+
+
 @app.get("/api/health")
 async def health():
     return {"ok": True, "mock": config.MOCK}
@@ -60,7 +81,8 @@ async def health():
 
 @app.get("/api/ping")
 async def ping():
-    return {"t": __import__("time").time()}
+    # 极轻量(浏览器模拟器每 3 秒探测一次):时间戳 + 当前运行的代码版本 + DeepSeek 状态
+    return {"t": time.time(), "code_version": config.CODE_VERSION, "ds": engine.ds["state"]}
 
 
 @app.get("/api/status")
