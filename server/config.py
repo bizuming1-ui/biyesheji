@@ -2,6 +2,8 @@
 import os
 from pathlib import Path
 
+CODE_VERSION = "v5"  # 浏览器模拟器的「检测日志」会读取它,用来判断 Kaggle 上跑的是不是最新代码
+
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("CLONE_DATA", ROOT / "data"))
 VOICE_DIR = DATA_DIR / "voices"
@@ -57,7 +59,7 @@ TTS_TEMPERATURE = float(os.environ.get("TTS_TEMPERATURE", "0.75"))
 TTS_TOP_K = int(os.environ.get("TTS_TOP_K", "40"))
 TTS_TOP_P = float(os.environ.get("TTS_TOP_P", "0.95"))
 
-TTS_DTYPE = os.environ.get("TTS_DTYPE", "float16")  # T4 无原生 bf16;若输出异常会自动回退 bfloat16
+TTS_DTYPE = os.environ.get("TTS_DTYPE", "bfloat16")  # v5: T4 上 float16 会让 Qwen3-TTS 采样出 NaN(训练失败的根因);bfloat16 是官方 T4 基准用的精度,出现数值异常会自动升到 float32
 LLM_DTYPE = os.environ.get("LLM_DTYPE", "float16")
 
 # 预合成并缓存的「思考语气词」(用克隆声音生成,每轮对话 0 延迟先播,正文在后台同步合成)
@@ -66,3 +68,10 @@ FILLERS = {
     "English": ["Hmm,", "Well,", "Okay,", "Sure,", "Let me think,"],
 }
 FILLER_HINT = "(系统已经替你先说了一个简短的语气词「%s」,你的正文请直接接着回答,不要再用语气词开头。)"
+
+# ---- 训练流水线(v5) ----
+TRAIN_AUX_WAIT = float(os.environ.get("TRAIN_AUX_WAIT", "30"))      # 合成完后最多再等 Whisper/相似度模型多少秒(不再无限等)
+TRAIN_SYNTH_STALL = float(os.environ.get("TRAIN_SYNTH_STALL", "240"))  # 训练里首次合成含声纹提取/图捕获,放宽无响应超时
+TRAIN_CHUNK = int(os.environ.get("TRAIN_CHUNK", "16"))              # 训练校验句用更大的流式块 → 更少的解码调用 → 更快
+TRAIN_MAX_SECONDS = float(os.environ.get("TRAIN_MAX_SECONDS", "900"))  # 超过这个时间的训练任务视为卡死,可被新训练取代
+TRAIN_ASR_WAIT = float(os.environ.get("TRAIN_ASR_WAIT", "90"))      # 自动识别参考文本最多等 Whisper 就绪多少秒
