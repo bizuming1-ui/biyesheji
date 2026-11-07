@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 
-from . import config
+from . import config, perf
 
 START = time.time()
 _LOG = collections.deque(maxlen=600)
@@ -134,7 +134,7 @@ def collect(engine) -> dict:
     }
     job = dict(status.get("job") or {})
     t0 = job.get("started")
-    return {
+    snap = {
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
         "uptime_s": round(time.time() - START, 1),
         "system": {
@@ -168,4 +168,8 @@ def collect(engine) -> dict:
         "mock": status.get("mock"),
         "server_log": server_log(120),
         "client_log": client_log(120),
+        "perf": perf.summary(),
+        "perf_recent": perf.recent(60),
     }
+    snap["analysis"] = perf.analyze(snap)
+    return snap
