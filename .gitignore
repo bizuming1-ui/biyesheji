@@ -4,3 +4,4 @@ data/
 data_test/
 *.wav
 .env
+data_test_*/
