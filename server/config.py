@@ -2,7 +2,7 @@
 import os
 from pathlib import Path
 
-CODE_VERSION = "v8"  # 浏览器模拟器的「检测日志」会读取它,用来判断 Kaggle 上跑的是不是最新代码
+CODE_VERSION = "v9"  # 浏览器模拟器的「检测日志」会读取它,用来判断 Kaggle 上跑的是不是最新代码
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("CLONE_DATA", ROOT / "data"))
@@ -21,9 +21,14 @@ ASR_MODEL = os.environ.get("ASR_MODEL", "openai/whisper-large-v3-turbo")
 SV_MODEL = os.environ.get("SV_MODEL", "microsoft/wavlm-base-plus-sv")
 
 SR = 24000  # Qwen3-TTS 输出采样率
-USE_DEEPSEEK = os.environ.get("LLM_BACKEND", "deepseek") == "deepseek"  # v7: 文本对话走 DeepSeek API;设 LLM_BACKEND=local 可回到本地 Qwen3-4B
-LLM_DEFAULT_TOKENS = int(os.environ.get("LLM_DEFAULT_TOKENS", "4096"))
-LLM_LONG_TOKENS = int(os.environ.get("LLM_LONG_TOKENS", "16384"))
+# v9: 对话大模型直接部署在 Kaggle GPU 上(Qwen3-4B-Instruct-2507,原生 262K 上下文),不再依赖任何外部 API / Key。
+LLM_DEFAULT_TOKENS = int(os.environ.get("LLM_DEFAULT_TOKENS", "6144"))     # 普通模式一次回答最多生成的 token(超出自动续写,播放无感)
+LLM_LONG_TOKENS = int(os.environ.get("LLM_LONG_TOKENS", "20000"))          # 「长文」模式的总 token 预算
+LLM_ROUND_TOKENS = int(os.environ.get("LLM_ROUND_TOKENS", "2048"))         # 每一轮 generate 的上限;撞到上限且没有自然结束 → 自动续写下一轮,直到预算用完
+LLM_PACE_TPS = float(os.environ.get("LLM_PACE_TPS", "12"))                 # 首批之后把生成速度限制在每秒多少 token:语音只消耗约 3~6 token/s,多生成只会和 TTS 抢 GPU;0=不限速
+LLM_PACE_BURST = int(os.environ.get("LLM_PACE_BURST", "48"))               # 每轮对话开头不限速的 token 数(保证首句、首声最快)
+LLM_CONT_MARK = "\x00CONT"                                                 # 续写信号(worker→引擎,不会进入文字流)
+LLM_LOAD_WAIT = float(os.environ.get("LLM_LOAD_WAIT", "900"))              # 对话模型还在加载时,一次对话最多等多少秒(而不是直接报错)
 HISTORY_CHARS = int(os.environ.get("HISTORY_CHARS", "24000"))
 LLM_FIRST_TOKEN_TIMEOUT = float(os.environ.get("LLM_FIRST_TOKEN_TIMEOUT", "45"))  # 秒,超时必给出错误,绝不静默卡死
 LLM_STALL_TIMEOUT = float(os.environ.get("LLM_STALL_TIMEOUT", "45"))
@@ -52,7 +57,7 @@ SYSTEM_PROMPT = (
 # 对话大模型(Qwen3-4B fp16 ≈ 7.5GiB)按层均分到两张卡,每卡只占约 3.8GiB,
 # 这样每张 T4(≈14.5GiB)都能同时放下:TTS(≈4.5GiB) + LLM 一半 + 其它,不再 OOM。
 LLM_SPLIT = os.environ.get("LLM_SPLIT", "1") == "1"
-LLM_MAX_MEM_GIB = float(os.environ.get("LLM_MAX_MEM_GIB", "4.6"))
+LLM_MAX_MEM_GIB = float(os.environ.get("LLM_MAX_MEM_GIB", "5.0"))
 TTS_LOAD_RETRIES = int(os.environ.get("TTS_LOAD_RETRIES", "2"))
 
 # 采样参数:温度越低越稳(音色更一致、杂音更少),越高越有情绪起伏。0.75 是实测的折中。
