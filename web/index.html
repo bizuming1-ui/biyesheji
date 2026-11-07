@@ -202,7 +202,6 @@
   <header>
     <div class="logo"><i>🎙</i>Voice Clone Studio</div>
     <button class="chip logbtn" id="logbtn" title="运行日志:全面检测哪一部分慢、哪一部分还能提升">📋 运行日志</button>
-    <button class="chip logbtn" id="dsbtn" title="填写 DeepSeek API Key(对话大模型走 DeepSeek 官方 API,不占 GPU)">🔑 DeepSeek <b id="t-ds">未填 Key</b></button>
     <div class="sp"></div>
     <div class="chip hide-n"><span class="dot" id="d-conn"></span>连接 <b id="t-conn">…</b></div>
     <div class="chip hide-n"><span class="dot" id="d-llm"></span>对话 <b id="t-llm">…</b></div>
@@ -240,7 +239,7 @@
       <div class="opts">
         <label class="tg on" id="tgAuto">🔊 自动播放</label>
         <label class="tg on" id="tgSmooth" title="播放中途若合成跟不上,先攒够缓冲再继续,避免卡顿">🧵 无停顿优先</label>
-        <label class="tg" id="tgFiller" title="先用缓存的克隆语气词出声(0 延迟)。DeepSeek 首字比语气词还慢时可能造成停顿,默认关闭">💬 语气词先行</label>
+        <label class="tg" id="tgFiller" title="先用缓存的克隆语气词出声(0 延迟)。本地模型首字已很快,语气词先行默认关闭">💬 语气词先行</label>
         <label class="tg" id="tgLong">📖 长文模式</label>
         <label class="tg hide-n">🌬 呼吸 <input type="range" id="breath" min="0" max="100" value="40" /></label>
         <button class="tg" id="reset">🧹 新对话</button>
@@ -256,15 +255,6 @@
     <nav class="tabs"><button data-t="clone">🎤 克隆</button><button data-t="chat" class="on">💬 对话</button></nav>
   </main>
 </div>
-<div id="dsmodal" style="position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:60"><div style="background:#111a33;border:1px solid #2a3868;border-radius:16px;padding:22px;width:min(460px,92vw);display:flex;flex-direction:column;gap:12px">
-  <b style="font-size:16px">🔑 DeepSeek API 设置</b>
-  <small style="color:var(--mut);line-height:1.6">Key 只保存在你浏览器本地和 Kaggle 服务进程内存里(不写磁盘、不进日志)。也可以直接在「浏览器模拟器」右上角填写,会自动同步到这里。</small>
-  <input class="t" id="dskey" type="password" placeholder="sk-xxxxxxxxxxxxxxxx" autocomplete="off" />
-  <select class="t" id="dsmodel"><option value="deepseek-v4-pro">deepseek-v4-pro(能力最强,默认)</option><option value="deepseek-flash">deepseek-flash(更快首字)</option></select>
-  <label style="font-size:13px;color:var(--mut)"><input type="checkbox" id="dsthink" /> 深度思考(能力更强,但首字会慢几秒;语音对话建议关闭)</label>
-  <div id="dsmsg" style="font-size:12px;min-height:18px;color:var(--mut)"></div>
-  <div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn" id="dsclose">关闭</button><button class="btn pri" id="dssave">保存并校验</button></div>
-</div></div>
 <div id="logmodal"><div class="lbox">
   <div class="lhead"><b>📋 运行日志 · 性能剖析</b>
     <label style="font-size:12px;color:var(--mut)"><input type="checkbox" id="logauto" checked /> 自动刷新</label>
@@ -301,34 +291,6 @@ showScript();
 const player = new GaplessPlayer(); window.player = player;
 
 let jobTimer = null;
-/* ---------------- DeepSeek 设置(Key 存浏览器本地;模拟器可通过 postMessage 同步) ---------------- */
-function loadDs() { try { return JSON.parse(localStorage.getItem("vc_ds") || "{}"); } catch (e) { return {}; } }
-function saveDs(o) { try { localStorage.setItem("vc_ds", JSON.stringify(o)); } catch (e) { /* 隐私模式 */ } }
-function dsCfg() { const c = loadDs(); return { key: c.key || "", model: c.model || "", thinking: !!c.thinking }; }
-async function applyDs(cfg, quiet) {
-  const msg = $("dsmsg");
-  if (!quiet) { msg.style.color = "var(--mut)"; msg.textContent = "正在校验 Key 并预热连接…"; }
-  try {
-    const r = await (await fetch("/api/deepseek", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(cfg) })).json();
-    if (!r.ok) { msg.style.color = "var(--bad,#ff6b6b)"; msg.textContent = "✗ " + r.error; return false; }
-    const sel = $("dsmodel");
-    if (r.models && r.models.length) sel.innerHTML = r.models.map((m) => `<option value="${m}">${m}${m === r.model ? "(当前)" : ""}</option>`).join("");
-    sel.value = r.model; saveDs({ key: cfg.key, model: r.model, thinking: cfg.thinking });
-    msg.style.color = "var(--ok)"; msg.textContent = `✓ Key 有效 · 模型 ${r.model} · 连接预热 ${r.latency_ms}ms`;
-    pollStatus(); return true;
-  } catch (e) { msg.style.color = "var(--bad,#ff6b6b)"; msg.textContent = "✗ 请求失败:" + e.message; return false; }
-}
-$("dsbtn").onclick = () => { const c = loadDs(); $("dskey").value = c.key || ""; $("dsthink").checked = !!c.thinking; if (c.model) $("dsmodel").value = c.model; $("dsmodal").style.display = "flex"; };
-$("dsclose").onclick = () => { $("dsmodal").style.display = "none"; };
-$("dssave").onclick = async () => { const ok = await applyDs({ key: $("dskey").value.trim(), model: $("dsmodel").value, thinking: $("dsthink").checked }); if (ok) setTimeout(() => ($("dsmodal").style.display = "none"), 900); };
-window.addEventListener("message", (e) => {   // 浏览器模拟器右上角填写的 Key 同步过来
-  const d = e.data; if (!d || d.type !== "vc-deepseek" || !d.key) return;
-  const c = loadDs(); if (c.key === d.key && c.model === d.model && !!c.thinking === !!d.thinking) return;
-  applyDs({ key: String(d.key).trim(), model: d.model || "", thinking: !!d.thinking }, true);
-});
-try { window.parent.postMessage({ vc: 1, ready: true }, "*"); } catch (e) { /* 非 iframe */ }
-(function () { const c = loadDs(); if (c.key) applyDs(c, true); })();
-
 /* ---------------- 状态轮询 ---------------- */
 let STATUS = null;
 async function pollStatus() {
@@ -340,14 +302,10 @@ async function pollStatus() {
     const ready = ttsStates.filter((x) => x === "ready").length;
     $("d-tts").className = "dot " + (ready === ttsStates.length ? "ok" : ttsStates.includes("error") ? "err" : "load");
     $("t-tts").textContent = ready + "/" + ttsStates.length + " 卡" + (s.mock ? "(模拟)" : "");
-    if (s.deepseek) {
-      const d = s.deepseek, hasKey = d.has_key || !!loadDs().key;
-      $("d-llm").className = "dot " + (d.state === "error" ? "err" : hasKey ? "ok" : "load");
-      $("t-llm").textContent = d.state === "error" ? "Key 失败" : hasKey ? "DeepSeek 就绪" : "待填 Key";
-      $("t-ds").textContent = hasKey ? (d.model || "已填写") : "未填 Key";
-    } else {
-      $("d-llm").className = "dot " + (st("llm") === "ready" ? "ok" : st("llm") === "error" ? "err" : "load");
-      $("t-llm").textContent = st("llm") === "ready" ? "就绪" : st("llm") === "error" ? "失败" : "加载中";
+    {
+      const ls = st("llm");
+      $("d-llm").className = "dot " + (ls === "ready" ? "ok" : ls === "error" ? "err" : "load");
+      $("t-llm").textContent = ls === "ready" ? "本地模型就绪" : ls === "error" ? "失败" : "加载中";
     }
     [0, 1].forEach((i) => {
       const g = (s.gpus || []).find((x) => x.index === i), el = $("g" + i);
@@ -612,7 +570,6 @@ function handleEvent(m, bubble) {
   } else if (m.type === "start") { player.ensure(); player.newTurn(m.turn); player.fillerFirst = !!m.filler; }
   else if (m.type === "text") { bubble.textContent += m.delta; scrollDown(); }
   else if (m.type === "plan") player.plan(m.est_s, !!m.final);
-  else if (m.type === "think") { $("pstate").textContent = "DeepSeek 思考中…"; }
   else if (m.type === "cont") toast("长文本自动续写第 " + m.round + " 段", 2500);
   else if (m.type === "notice") addMsg("s", m.text);
   else if (m.type === "warn") toast(m.text, 4000);
@@ -684,7 +641,7 @@ async function streamChat(body, my, bubble) {
 async function doChat(text, speak) {
   const my = ++runId;
   const bubble = curBubble = addMsg("a live", ""); tSend = performance.now();
-  const body = { sid: SID, text, speak: !!speak, opts: { long: longMode, breath: $("breath").value / 100, filler: fillerOn, ds: dsCfg() } };
+  const body = { sid: SID, text, speak: !!speak, opts: { long: longMode, breath: $("breath").value / 100, filler: fillerOn } };
   let tid = null, after = 0;
   if (streamMode) {
     const st = await streamChat(body, my, bubble);
