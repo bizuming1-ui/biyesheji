@@ -15,7 +15,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 PORT = int(os.environ.get("PORT", "7860"))
-MARK = Path("/tmp/.clone_deps_ok_v5")
+MARK = Path("/tmp/.clone_deps_ok_v7")
 
 
 def log(*a):
@@ -147,7 +147,7 @@ def predownload():
 
     from server import config
 
-    repos = [config.TTS_MODEL, config.LLM_MODEL, config.ASR_MODEL, config.SV_MODEL]
+    repos = [config.TTS_MODEL, config.ASR_MODEL, config.SV_MODEL] + ([] if config.USE_DEEPSEEK else [config.LLM_MODEL])  # v7: 对话走 DeepSeek API,不再下载本地 LLM(省 ~8GB)
 
     def dl(r):
         t = time.time()
