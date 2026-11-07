@@ -17,6 +17,7 @@ import traceback
 import numpy as np
 
 from . import config
+from .errors import is_numeric_error, next_dtype
 
 
 # ----------------------------------------------------------------------------
@@ -36,21 +37,33 @@ def _fake_voice(text: str, sr: int, seed: int = 0) -> np.ndarray:
 class MockTTS:
     def __init__(self, gpu):
         self.gpu, self.voices = gpu, {}
+        self.dtype = config.TTS_DTYPE
+
+    def _numeric_check(self):
+        """测试用:MOCK_NUMERIC_DTYPE=float16,bfloat16 → 以这些精度运行时模拟「probability tensor contains inf/nan」崩溃,
+        用来验证引擎会自动重启进程、降级精度、重试训练。"""
+        bad = [x for x in os.environ.get("MOCK_NUMERIC_DTYPE", "").split(",") if x]
+        if self.dtype in bad:
+            raise RuntimeError("TTS_NUMERIC(%s): probability tensor contains either inf, nan or element < 0" % self.dtype)
 
     def load(self, args, emit):
         time.sleep(0.4)
+        if args and args.get("dtype"):
+            self.dtype = args["dtype"]
         if os.environ.get("MOCK_FAIL_TTS") == str(self.gpu):  # 测试用:模拟某张卡 TTS 加载失败
             raise RuntimeError("模拟的 TTS 加载失败(MOCK_FAIL_TTS=%d)" % self.gpu)
-        return {"device": "mock:%d" % self.gpu, "engine": "mock-stream"}
+        return {"device": "mock:%d" % self.gpu, "engine": "mock-stream", "dtype": self.dtype}
 
     def prepare(self, args, emit):
         time.sleep(0.3)
+        self._numeric_check()
         self.voices[args["voice_id"]] = True
         want = args.get("modes") or ["icl", "xvec"]
         modes = [m for m in want if m != "icl" or (args.get("ref_text") or "").strip()]
-        return {"modes": modes}
+        return {"modes": modes, "dtype": self.dtype}
 
     def synth(self, args, emit, cancelled=lambda: False):
+        self._numeric_check()
         text = args["text"]
         seed = 0 if args.get("mode") == "icl" else 1
         wav = _fake_voice(text, config.SR, seed)
@@ -180,38 +193,69 @@ class RealTTS:
         self.dtype_name = dtype_name
 
     def load(self, args, emit):
-        self._load_model(self.dtype_name)
+        want = (args or {}).get("dtype") or self.dtype_name
+        self._load_model(want)
         return {"device": "cuda(GPU%d)" % self.gpu, "dtype": self.dtype_name, "engine": self.engine_name}
 
-    def _fallback_bf16(self):
-        """fp16 数值溢出(输出 NaN/全零)时,换 bf16 重新加载并重建所有声音。"""
+    def _reload(self, dtype_name):
+        """数值溢出(输出 NaN/全零)时,换更稳的精度重新加载,并重建所有声音(进程上下文仍健康时才可用)。"""
         import gc
 
         import torch
 
         self.model = self.fast = None
-        self.preps_keep = dict(self.preps)
+        self.__dict__.pop("_prompt_cache", None)
+        keep = dict(self.preps)
         self.preps = {}
         gc.collect()
         torch.cuda.empty_cache()
-        self._load_model("bfloat16")
-        for a in list(self.preps_keep.values()):
-            self.prepare(a, None)
+        self._load_model(dtype_name)
+        for a in list(keep.values()):
+            self.prepare(dict(a, warm=False), None)
 
     # ---- 声音 prompt ----
     def prepare(self, args, emit):
-        """构建/预热可复用的声音克隆 prompt(ICL 与 x-vector 两种都构建,后续择优)。"""
+        """构建可复用的声音克隆 prompt(ICL / x-vector)。
+        warm=False(训练时): 只提取并缓存声纹,不再多合成一句「嗯。」(校验句本身就会预热) → 训练更快。
+        warm=True(恢复声音/补卡时): 真实合成一小句,让 CUDA Graph 与解码器完全热起来。"""
         vid = args["voice_id"]
         old = self.preps.get(vid, {})
         text = (args.get("ref_text") or old.get("ref_text") or "").strip()
-        self.preps[vid] = {**old, **args, "ref_text": text}
+        self.preps[vid] = {**old, **{k: v for k, v in args.items() if k != "warm"}, "ref_text": text}
         want = args.get("modes") or (["icl"] if text else []) + ["xvec"]
         modes = [m for m in want if m != "icl" or text]
         lang = "Chinese" if any("\u4e00" <= c <= "\u9fff" for c in text) or not text else "English"
-        for m in modes:  # 真实合成一小句(很短) → 缓存声纹 + 让 CUDA Graph 完全热起来
-            for _ in self._gen(vid, "嗯。" if lang == "Chinese" else "Hmm.", lang, m, chunk=8, max_new=36):
-                pass
-        return {"modes": modes}
+        warm = bool(args.get("warm", True))
+        try:
+            for m in modes:
+                if not warm and self._prime(vid, m):
+                    continue
+                for _ in self._gen(vid, "嗯。" if lang == "Chinese" else "Hmm.", lang, m, chunk=8, max_new=36):
+                    pass
+        except Exception as e:  # noqa: BLE001
+            if is_numeric_error(e):
+                raise RuntimeError("TTS_NUMERIC(%s): %s" % (self.dtype_name, _last_line(e)))
+            raise
+        return {"modes": modes, "dtype": self.dtype_name}
+
+    def _prime(self, vid, mode) -> bool:
+        """只构建并缓存声纹 prompt(不生成音频)。成功返回 True;任何不确定的情况返回 False → 走真实合成预热。"""
+        if self.fast is None:
+            return False
+        try:
+            a = self.preps[vid]
+            ref_text = (a.get("ref_text") or "").strip()
+            if mode == "icl" and not ref_text:
+                mode = "xvec"
+            self.fast._resolve_voice_clone_prompt_from_reference(
+                input_ids=[None], ref_audio=a["ref_path"], ref_text=ref_text, xvec_only=(mode == "xvec"), append_silence=True,
+            )
+            return True
+        except Exception as e:  # noqa: BLE001
+            if is_numeric_error(e):
+                raise
+            print("[tts gpu%d] 仅提取声纹失败,改用合成预热: %s" % (self.gpu, _last_line(e)), flush=True)
+            return False
 
     # ---- 合成 ----
     def _gen(self, vid, text, lang, mode, chunk, cancelled=lambda: False, max_new=None):
@@ -250,24 +294,32 @@ class RealTTS:
         text, vid = args["text"], args["voice_id"]
         lang, mode = args.get("lang", "Chinese"), args.get("mode", "icl")
         chunk = int(args.get("chunk", config.TTS_CHUNK_NEXT))
-        for attempt in (0, 1):
+        for attempt in range(3):
             total, sr_out, bad = 0, config.SR, False
-            for w, sr in self._gen(vid, text, lang, mode, chunk, cancelled):
-                if not np.all(np.isfinite(w)):
-                    bad = True
-                    break
-                if total == 0 and w.size and float(np.max(np.abs(w))) < 1e-5 and w.size > sr * 0.2:
-                    bad = True
-                    break
-                total += w.size
-                sr_out = sr
-                emit({"pcm": w, "sr": sr})
+            try:
+                for w, sr in self._gen(vid, text, lang, mode, chunk, cancelled):
+                    if not np.all(np.isfinite(w)):
+                        bad = True
+                        break
+                    if total == 0 and w.size and float(np.max(np.abs(w))) < 1e-5 and w.size > sr * 0.2:
+                        bad = True
+                        break
+                    total += w.size
+                    sr_out = sr
+                    emit({"pcm": w, "sr": sr})
+            except Exception as e:  # noqa: BLE001
+                # CUDA 设备端断言(probability tensor contains inf/nan)会让本进程的 CUDA 上下文报废,
+                # 这里不能原地恢复 → 抛出带 TTS_NUMERIC 标记的错误,由引擎重启进程并降级精度。
+                if is_numeric_error(e):
+                    raise RuntimeError("TTS_NUMERIC(%s): %s" % (self.dtype_name, _last_line(e)))
+                raise
             if not bad:
                 return {"samples": total, "sr": sr_out}
-            if attempt == 1 or self.dtype_name != "float16":
-                raise RuntimeError("TTS 输出异常(NaN/静音),请把环境变量 TTS_DTYPE 设为 bfloat16 再试")
-            print("[tts gpu%d] fp16 输出异常,自动回退 bfloat16" % self.gpu, flush=True)
-            self._fallback_bf16()
+            nxt = next_dtype(self.dtype_name)
+            if nxt is None or attempt == 2:
+                raise RuntimeError("TTS_NUMERIC(%s): 输出异常(NaN/静音)" % self.dtype_name)
+            print("[tts gpu%d] %s 输出异常,自动回退 %s" % (self.gpu, self.dtype_name, nxt), flush=True)
+            self._reload(nxt)
         raise RuntimeError("unreachable")
 
 
