@@ -92,7 +92,7 @@ try:
     check("analysis present", len(an) > 0, an[:2])
     check("analysis flags slow upload", any(a["area"] == "上传" and a["level"] == "warn" for a in an), [a for a in an if a["area"] == "上传"])
     check("analysis names slowest training stage", any(a["area"] == "训练" and "最慢阶段" in a["msg"] for a in an), [a["msg"] for a in an][:4])
-    check("diag version v6", d["config"].get("CODE_VERSION") == "v7")
+    check("diag version v6", d["config"].get("CODE_VERSION") == "v8")
     pr = c.get("/api/perf").json()
     check("/api/perf", "summary" in pr and "recent" in pr)
     # 旧接口兼容
