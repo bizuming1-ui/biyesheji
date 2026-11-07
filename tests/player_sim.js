@@ -44,7 +44,7 @@ function run(name, chunks, estTotal, opts) {
     p.tick();
     if (p.state === "idle" && i === chunks.length && p.expect >= total && firstSound !== null) break;
   }
-  const r = { name, first: firstSound === null ? null : +firstSound.toFixed(2), prebuf: +p.prebufferS.toFixed(2), underruns: p.underruns, gapTotal: +p.gapTotal.toFixed(2), played: p.expect === total };
+  const r = { name, first: firstSound === null ? null : +firstSound.toFixed(2), prebuf: +p.prebufferS.toFixed(2), underruns: p.underruns, gapTotal: +p.gapTotal.toFixed(2), played: p.expect === total, qMin: +p.qMinUsed.toFixed(2) };
   return r;
 }
 
@@ -82,6 +82,16 @@ expectOk(run("0.95x / 180s 长文本", gen(180, 0.95, 1.0, 0.33, 0, 99), 180), 2
 const s8 = run("短句首声", gen(2, 3, 0.8, 0.33, 0, 99), 2);
 results.push(s8); console.log(JSON.stringify(s8));
 if (s8.first === null || s8.first > 1.6 || s8.underruns) fails.push("短句首声");
+
+// v8 首声预算:弹性变速使「速率≈实时」的场景不再需要长预缓冲(v7 实测:1.0x→16.4s, 0.95x/180s→15.9s)
+const byName = (n) => results.find((r) => r.name === n);
+[["1.0x + 句间停顿0.4s / 60s", 3.0], ["0.95x / 180s 长文本", 8.0], ["0.91x(RTF 1.1)+ 停顿 / 60s", 8.0], ["快速合成 3x / 60s", 2.0]].forEach(([n, max]) => {
+  const r = byName(n);
+  if (!r || r.first === null || r.first > max) { fails.push("首声预算 " + n + " " + (r && r.first) + "s > " + max + "s"); console.log("FAIL 首声预算", n, r && r.first); }
+  else console.log("PASS 首声预算", n, r.first + "s <= " + max + "s");
+});
+// 变速范围受限:最慢不低于 0.87
+results.forEach((r) => { if (r.qMin < 0.87 - 1e-9) fails.push("q 越界 " + r.name); });
 
 console.log(fails.length ? "FAILED: " + fails.join(" | ") : "ALL PASS (" + results.length + " scenarios)");
 process.exit(fails.length ? 1 : 0);
