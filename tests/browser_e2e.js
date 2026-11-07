@@ -14,7 +14,7 @@ function wav(sec, sr, ch) {
   return b;
 }
 (async () => {
-  const srv = spawn("python3", ["-m", "uvicorn", "server.app:app", "--port", PORT, "--no-access-log"], { cwd: ROOT, env: { ...process.env, CLONE_MOCK: "1", PORT, CLONE_DATA: path.join(ROOT, "data_test_browser") }, stdio: "ignore" });
+  const srv = spawn("python3", ["-m", "uvicorn", "server.app:app", "--port", PORT, "--no-access-log"], { cwd: ROOT, env: { ...process.env, CLONE_MOCK: "1", LLM_BACKEND: "local", PORT, CLONE_DATA: path.join(ROOT, "data_test_browser") }, stdio: "ignore" });
   const f = path.join("/tmp", "ref70.wav"); fs.writeFileSync(f, wav(70, 44100, 2));
   check("test wav is big (like user's 4.6MB)", fs.statSync(f).size > 10e6, fs.statSync(f).size);
   try {
