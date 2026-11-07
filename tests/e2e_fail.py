@@ -33,7 +33,7 @@ def ref():
 
 
 def main():
-    env = dict(os.environ, CLONE_MOCK="1", PORT=str(PORT), MOCK_FAIL_TTS="1", TTS_LOAD_RETRIES="1", CLONE_DATA="/tmp/clone_fail_data")
+    env = dict(os.environ, CLONE_MOCK="1", LLM_BACKEND="local", PORT=str(PORT), MOCK_FAIL_TTS="1", TTS_LOAD_RETRIES="1", CLONE_DATA="/tmp/clone_fail_data")
     p = subprocess.Popen([sys.executable, "-m", "uvicorn", "server.app:app", "--port", str(PORT)], cwd=ROOT, env=env,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
