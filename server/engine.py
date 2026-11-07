@@ -15,6 +15,7 @@ import numpy as np
 
 from . import audio_utils as au
 from . import config
+from .errors import NumericError, is_numeric_error, next_dtype
 from .text_chunker import SentenceChunker, clean_for_tts, detect_language, is_speakable
 
 
@@ -33,6 +34,7 @@ class Worker:
         self.error = None
         self.info: dict = {}
         self.busy_ms = 0.0
+        self.dtype = config.TTS_DTYPE if kind == "tts" else None  # TTS 当前精度(数值异常时按 bfloat16→float32 逐级回退)
         self._spawn()
 
     def _spawn(self):
@@ -52,8 +54,14 @@ class Worker:
         try:
             if self.proc.is_alive():
                 self.proc.terminate()
+                self.proc.join(timeout=6)  # 必须等进程真正退出,显存才会释放给新进程
+                if self.proc.is_alive():
+                    self.proc.kill()
+                    self.proc.join(timeout=4)
         except Exception:  # noqa: BLE001
             pass
+        for rid, q in list(self.pending.items()):  # 还在等旧进程的请求立刻失败,不要永远等下去
+            q.put_nowait({"id": rid, "type": "error", "error": "%s 进程已重启" % self.name})
         self.pending.clear()
         self.inflight = 0
         self.next_id = 1
@@ -268,8 +276,9 @@ class Engine:
         t0 = time.time()
         tries = 1 + max(0, config.TTS_LOAD_RETRIES)
         for attempt in range(tries):
+            proc = w.proc
             try:
-                w.info = await w.call("load")
+                w.info = await (w.call("load", dtype=w.dtype) if w.kind == "tts" else w.call("load"))
                 w.state = "ready"
                 w.info["load_s"] = round(time.time() - t0, 1)
                 print("[engine] worker %s 就绪 (%.0fs) %s" % (w.name, time.time() - t0, w.info), flush=True)
@@ -277,12 +286,49 @@ class Engine:
                     asyncio.create_task(self._prep_late(w))
                 return
             except Exception as e:  # noqa: BLE001
+                if w.proc is not proc:
+                    return  # 进程已被重启(降级精度/重新加载):这个旧的加载任务作废,由新的 _load 接管,绝不能再往新进程里塞第二次加载
                 w.error = str(e)[-1500:]
                 print("[engine] worker %s 加载失败(第 %d/%d 次):\n%s" % (w.name, attempt + 1, tries, e), flush=True)
                 if attempt + 1 < tries:
                     w.state = "loading"
                     await asyncio.sleep(4)  # 等其它进程加载完、显存峰值过去后重试
         w.state = "error"
+
+    async def downgrade_tts(self, target: str) -> bool:
+        """TTS 数值异常(NaN/inf/CUDA 断言)后:重启所有 TTS 进程并改用更稳的精度(进程上下文已报废,无法原地恢复)。"""
+        lock = self.__dict__.setdefault("_dg_lock", asyncio.Lock())
+        async with lock:
+            todo = [w for w in self.tts if w.dtype != target]
+            if not todo:
+                return True  # 别的任务已经降过级了
+            self._log("⚠ TTS 数值异常 → 重启 TTS 进程并改用 %s(这是 T4 上 float16 的已知问题,不需要你做任何事)" % target)
+            for w in todo:
+                w.dtype = target
+                w.state = "loading"
+                w.error = None
+                w.respawn()
+                asyncio.create_task(self._load(w))
+            t0 = time.time()
+            while time.time() - t0 < 600:
+                if any(w.state == "ready" for w in todo) or all(w.state == "error" for w in todo):
+                    break
+                if self.job.get("state") == "running":
+                    self._set(stage="TTS 以 %s 精度重新加载 %ds" % (target, time.time() - t0))
+                await asyncio.sleep(0.5)
+            return bool([w for w in todo if w.state == "ready"])
+
+    async def _auto_downgrade(self):
+        """对话/合成阶段遇到数值异常:后台降级精度(只触发一次),完成后 _load 会自动补回当前声音。"""
+        if self.__dict__.get("_auto_dg_busy"):
+            return
+        self._auto_dg_busy = True
+        try:
+            nxt = next_dtype(self.tts[0].dtype if self.tts else None)
+            if nxt:
+                await self.downgrade_tts(nxt)
+        finally:
+            self._auto_dg_busy = False
 
     async def _prep_late(self, w: Worker):
         """某张卡比声音训练晚就绪(或重载成功)时,自动给它补上当前声音,让双卡一起干活。"""
@@ -422,15 +468,18 @@ class Engine:
         self.job.update(kw)
 
     async def start_training(self, audio: bytes, ref_text: str, lang: str = "zh"):
-        if self.job.get("state") == "running" and time.time() - self.job.get("started", 0) < 900:
-            raise RuntimeError("训练正在进行中")
+        if self.job.get("state") == "running" and time.time() - self.job.get("started", 0) < config.TRAIN_MAX_SECONDS:
+            raise RuntimeError("训练正在进行中(已 %d 秒,请看下面的进度;超过 %d 秒仍无进展会自动允许重新开始)" % (time.time() - self.job.get("started", 0), config.TRAIN_MAX_SECONDS))
+        old = getattr(self, "_train_task", None)
+        if old is not None and not old.done():
+            old.cancel()  # 上一次训练卡死了:取消它,再开始新的,不会出现两个训练同时跑
         n = max(1, len(self.tts))
         self.job = {
             "state": "running", "stage": "准备中", "progress": 1, "log": [], "warnings": [],
             "gpus": [{"gpu": w.gpu, "progress": 0, "msg": "等待"} for w in self.tts[:n]],
             "similarity": None, "quality": None, "started": time.time(),
         }
-        asyncio.create_task(self._train(audio, ref_text.strip(), lang))
+        self._train_task = asyncio.create_task(self._train(audio, ref_text.strip(), lang))  # 持有强引用,防止任务被垃圾回收
 
     def _gpu_msg(self, i, progress, msg):
         gs = self.job.get("gpus", [])
@@ -443,7 +492,11 @@ class Engine:
     async def _get_ref_text(self, ref, ref_text, aux_task, lang):
         if ref_text:
             return ref_text
-        if not await aux_task:
+        try:  # Whisper 还在加载时最多等 TRAIN_ASR_WAIT 秒,超时就只用 x-vector 模式,训练不会被它拖住
+            aux_ok = await asyncio.wait_for(asyncio.shield(aux_task), config.TRAIN_ASR_WAIT)
+        except asyncio.TimeoutError:
+            aux_ok = False
+        if not aux_ok:
             self._log("⚠ 语音识别模型未就绪,本次只用 x-vector 模式(不需要文本)")
             return ""
         self._set(stage="自动识别参考语音文本 (Whisper @ GPU%d)" % self.aux.gpu)
@@ -456,140 +509,173 @@ class Engine:
             return ""
 
     async def _train(self, audio: bytes, ref_text: str, lang_hint: str = "zh"):
+        """训练入口:真正的流水线在 _train_inner。TTS 出现数值异常(float16 在 T4 上采样出 NaN 的已知问题)时,
+        自动重启 TTS 进程、换更稳的精度(bfloat16 → float32),然后自动重试 —— 用户不需要做任何事。"""
+        retries = 0
+        try:
+            while True:
+                try:
+                    await self._train_inner(audio, ref_text, lang_hint)
+                    return
+                except asyncio.CancelledError:
+                    self._set(state="error", stage="已取消", error="训练被新的训练任务取代")
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    cur = self.tts[0].dtype if self.tts else None
+                    nxt = next_dtype(cur)
+                    if (isinstance(e, NumericError) or is_numeric_error(e)) and nxt and retries < 2:
+                        retries += 1
+                        self._log("⚠ TTS 数值异常(%s):%s" % (cur, (str(e).strip().splitlines() or ["?"])[-1][:160]))
+                        self._set(stage="TTS 数值异常,自动切换 %s 精度并重试(第 %d 次)" % (nxt, retries), progress=3)
+                        ok = await self.downgrade_tts(nxt)
+                        if not ok:
+                            raise RuntimeError("切换到 %s 后 TTS 仍无法加载: %s" % (nxt, self.error_summary(self.tts) or "未知原因"))
+                        continue
+                    raise
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:  # noqa: BLE001
+            msg = (str(e).strip().splitlines() or [""])[-1] or repr(e)
+            self._set(state="error", stage="失败", error=msg)
+            self._log("失败: " + msg)
+            print(e, flush=True)
+
+    async def _train_inner(self, audio: bytes, ref_text: str, lang_hint: str = "zh"):
         """加速版流水线: 两张卡从第一秒起就同时干活。
         GPU0: 提取 x-vector 声纹 → 合成校验句 → 相似度;   aux(GPU1): Whisper 识别文本
         GPU1: (等文本) 提取 ICL 上下文 → 合成校验句 → 相似度;   最后把胜出的模式补到另一张卡。
         语气词缓存放到后台,不再占用训练时间。"""
-        try:
-            self._set(stage="等待模型加载", progress=3)
-            tts_ws = await self._ensure_ready()
+        self._set(stage="等待模型加载", progress=3)
+        tts_ws = await self._ensure_ready()
 
-            async def _aux_wait():  # Whisper/相似度模型:后台等它,绝不阻塞训练起步
-                if self.aux is None:
-                    return False
-                try:
-                    await self._wait_loaded([self.aux], timeout=300)
-                except Exception:  # noqa: BLE001
-                    return False
-                if self.aux.state != "ready":
-                    self._log("⚠ Whisper/相似度模型未就绪:" + (self.error_summary([self.aux]) or "?"))
-                return self.aux.state == "ready"
+        async def _aux_wait():  # Whisper/相似度模型:后台等它,绝不阻塞训练起步
+            if self.aux is None:
+                return False
+            try:
+                await self._wait_loaded([self.aux], timeout=300)
+            except Exception:  # noqa: BLE001
+                return False
+            if self.aux.state != "ready":
+                self._log("⚠ Whisper/相似度模型未就绪:" + (self.error_summary([self.aux]) or "?"))
+            return self.aux.state == "ready"
 
-            aux_task = asyncio.create_task(_aux_wait())
-            # 1. 参考音频清洗
-            self._set(stage="参考音频清洗(解码/降噪/切静音/归一化)", progress=8)
-            x = await asyncio.to_thread(au.decode_audio, audio, config.SR)
-            if x.size < config.SR * 1.5:
-                raise ValueError("参考音频太短(<1.5s),请至少录制 5 秒以上")
-            ref, quality, warns = await asyncio.to_thread(au.preprocess_reference, x, config.SR)
-            self._set(quality=quality, warnings=warns)
-            self._log("参考音频 %.1fs, 信噪比≈%.0fdB" % (quality["duration"], quality.get("snr_db_raw", 0)))
-            vid = uuid.uuid4().hex[:8]
-            cur = config.VOICE_DIR / "current"
-            if cur.exists():
-                shutil.rmtree(cur, ignore_errors=True)
-            cur.mkdir(parents=True, exist_ok=True)
-            ref_path = cur / ("ref_%s.wav" % vid)  # 每次训练换新文件名,避免 TTS 内部按路径缓存到旧声音
-            await asyncio.to_thread(au.write_wav, ref_path, ref, config.SR)
-            ref16 = au.resample(ref, config.SR, 16000)
-            ref_db = au.to_db(au.rms(ref))
-            zh = lang_hint != "en"
-            if ref_text:
-                zh = detect_language(ref_text) == "Chinese"
-            test = "今天天气真不错,我们一起去公园散步吧。" if zh else "The weather is lovely today, let's take a walk in the park."
-            lang = "Chinese" if zh else "English"
+        aux_task = asyncio.create_task(_aux_wait())
+        # 1. 参考音频清洗
+        self._set(stage="参考音频清洗(解码/降噪/切静音/归一化)", progress=8)
+        x = await asyncio.to_thread(au.decode_audio, audio, config.SR)
+        if x.size < config.SR * 1.5:
+            raise ValueError("参考音频太短(<1.5s),请至少录制 5 秒以上")
+        ref, quality, warns = await asyncio.to_thread(au.preprocess_reference, x, config.SR)
+        self._set(quality=quality, warnings=warns)
+        self._log("参考音频 %.1fs, 信噪比≈%.0fdB" % (quality["duration"], quality.get("snr_db_raw", 0)))
+        vid = uuid.uuid4().hex[:8]
+        cur = config.VOICE_DIR / "current"
+        if cur.exists():
+            shutil.rmtree(cur, ignore_errors=True)
+        cur.mkdir(parents=True, exist_ok=True)
+        ref_path = cur / ("ref_%s.wav" % vid)  # 每次训练换新文件名,避免 TTS 内部按路径缓存到旧声音
+        await asyncio.to_thread(au.write_wav, ref_path, ref, config.SR)
+        ref16 = au.resample(ref, config.SR, 16000)
+        ref_db = au.to_db(au.rms(ref))
+        zh = lang_hint != "en"
+        if ref_text:
+            zh = detect_language(ref_text) == "Chinese"
+        test = "今天天气真不错,我们去散步吧。" if zh else "The weather is lovely today, let's go for a walk."
+        lang = "Chinese" if zh else "English"
 
-            # 2. 双卡并行
-            self._set(stage="双卡并行:声纹提取 + 文本识别 + 合成校验", progress=15)
-            for w_ in tts_ws:
-                self._gpu_msg(self.tts.index(w_), 5, "等待")
-            w0 = tts_ws[0]
-            w1 = tts_ws[1] if len(tts_ws) > 1 else tts_ws[0]
-            text_task = asyncio.create_task(self._get_ref_text(ref, ref_text, aux_task, "zh" if zh else "en"))
-            prepared: dict[str, set] = {}
-            scores: dict[str, float] = {}
+        # 2. 双卡并行
+        self._set(stage="双卡并行:声纹提取 + 文本识别 + 合成校验", progress=15)
+        for w_ in tts_ws:
+            self._gpu_msg(self.tts.index(w_), 5, "等待")
+        w0 = tts_ws[0]
+        w1 = tts_ws[1] if len(tts_ws) > 1 else tts_ws[0]
+        text_task = asyncio.create_task(self._get_ref_text(ref, ref_text, aux_task, "zh" if zh else "en"))
+        prepared: dict[str, set] = {}
+        scores: dict[str, float] = {}
 
-            async def eval_mode(w, mode, text):
-                i = self.tts.index(w)
-                self._gpu_msg(i, 15, "提取声纹(%s)" % mode)
-                await w.call("prepare", _timeout=300, voice_id=vid, ref_path=str(ref_path), ref_text=text, modes=[mode])
-                prepared.setdefault(w.name, set()).add(mode)
-                self._gpu_msg(i, 50, "合成校验句(%s)" % mode)
-                wav, sr = await self.synth_collect(w, vid, test, lang, mode)
-                wav = await asyncio.to_thread(au.postprocess_chunk, wav, sr, ref_db, True, 0.0)
-                aux_ok = await aux_task
-                if not aux_ok:
-                    self._gpu_msg(i, 90, "%s 就绪" % mode)
-                    return mode, None
-                s_ = await self.aux.call("sim", _timeout=120, a=ref16, b=au.resample(wav, sr, 16000))
-                self._gpu_msg(i, 90, "%s 相似度 %.1f%%" % (mode, s_["cosine"] * 100))
-                return mode, s_["cosine"]
+        async def eval_mode(w, mode, text):
+            i = self.tts.index(w)
+            self._gpu_msg(i, 15, "提取声纹(%s)" % mode)
+            await w.call("prepare", _timeout=300, voice_id=vid, ref_path=str(ref_path), ref_text=text, modes=[mode], warm=False)
+            prepared.setdefault(w.name, set()).add(mode)
+            self._gpu_msg(i, 50, "合成校验句(%s)" % mode)
+            wav, sr = await self.synth_collect(w, vid, test, lang, mode, chunk=config.TRAIN_CHUNK, stall=config.TRAIN_SYNTH_STALL)
+            wav = await asyncio.to_thread(au.postprocess_chunk, wav, sr, ref_db, True, 0.0)
+            try:  # 合成完最多再等 Whisper/相似度模型 TRAIN_AUX_WAIT 秒,不再无限等(慢的话只用 x-vector/ICL 默认择优)
+                aux_ok = await asyncio.wait_for(asyncio.shield(aux_task), config.TRAIN_AUX_WAIT)
+            except asyncio.TimeoutError:
+                aux_ok = False
+                self._log("⚠ 相似度模型 %ds 内未就绪,本次跳过相似度打分" % config.TRAIN_AUX_WAIT)
+            if not aux_ok:
+                self._gpu_msg(i, 90, "%s 就绪" % mode)
+                return mode, None
+            s_ = await self.aux.call("sim", _timeout=120, a=ref16, b=au.resample(wav, sr, 16000))
+            self._gpu_msg(i, 90, "%s 相似度 %.1f%%" % (mode, s_["cosine"] * 100))
+            return mode, s_["cosine"]
 
-            async def path_x():
-                return await eval_mode(w0, "xvec", "")
+        async def path_x():
+            return await eval_mode(w0, "xvec", "")
 
-            async def path_i():
-                text = await text_task
-                if not text:
-                    return None
-                return await eval_mode(w1, "icl", text)
-
-            res = await asyncio.gather(path_x(), path_i(), return_exceptions=True)
+        async def path_i():
             text = await text_task
-            for r in res:
-                if isinstance(r, Exception):
-                    self._log("模式评估失败: %s" % (str(r).strip().splitlines() or [repr(r)])[-1])
-                elif r is not None:
-                    self._log("模式 %s 说话人相似度 %s" % (r[0], "%.2f%%" % (r[1] * 100) if r[1] is not None else "N/A"))
-                    if r[1] is not None:
-                        scores[r[0]] = float(r[1])
-            ok_modes = [m for ws_ in prepared.values() for m in ws_]
-            if not ok_modes:
-                raise RuntimeError("所有克隆模式都失败了:" + "; ".join(str(r) for r in res if isinstance(r, Exception))[-300:])
-            best = max(scores, key=scores.get) if scores else ("icl" if "icl" in ok_modes else "xvec")
-            sim = scores.get(best)
-            # 3. 把胜出的模式补到另一张卡,保证双卡都能合成
-            self._set(stage="同步声音到双卡", progress=90)
+            if not text:
+                return None
+            return await eval_mode(w1, "icl", text)
 
-            async def ensure(w):
-                i = self.tts.index(w)
-                if best in prepared.get(w.name, set()):
-                    self._gpu_msg(i, 100, "完成")
-                    return w.name
-                try:
-                    self._gpu_msg(i, 92, "同步 %s 声纹" % best)
-                    await w.call("prepare", _timeout=300, voice_id=vid, ref_path=str(ref_path), ref_text=text, modes=[best])
-                    self._gpu_msg(i, 100, "完成")
-                    return w.name
-                except Exception as e:  # noqa: BLE001
-                    self._log("%s 同步失败: %s" % (w.name, (str(e).strip().splitlines() or ["?"])[-1]))
-                    return None
+        res = await asyncio.gather(path_x(), path_i(), return_exceptions=True)
+        for r in res:  # 任何一张卡出现数值异常 → 整体降级精度重试(该卡的 CUDA 上下文已报废)
+            if isinstance(r, Exception) and is_numeric_error(r):
+                raise NumericError((str(r).strip().splitlines() or ["TTS_NUMERIC"])[-1])
+        text = await text_task
+        for r in res:
+            if isinstance(r, Exception):
+                self._log("模式评估失败: %s" % (str(r).strip().splitlines() or [repr(r)])[-1])
+            elif r is not None:
+                self._log("模式 %s 说话人相似度 %s" % (r[0], "%.2f%%" % (r[1] * 100) if r[1] is not None else "N/A"))
+                if r[1] is not None:
+                    scores[r[0]] = float(r[1])
+        ok_modes = [m for ws_ in prepared.values() for m in ws_]
+        if not ok_modes:
+            raise RuntimeError("所有克隆模式都失败了:" + "; ".join(str(r) for r in res if isinstance(r, Exception))[-300:])
+        best = max(scores, key=scores.get) if scores else ("icl" if "icl" in ok_modes else "xvec")
+        sim = scores.get(best)
+        # 3. 把胜出的模式补到另一张卡,保证双卡都能合成
+        self._set(stage="同步声音到双卡", progress=90)
 
-            names = [n for n in await asyncio.gather(*[ensure(w) for w in tts_ws]) if n]
-            if not names:
-                raise RuntimeError("声音同步失败")
-            self.voice = {
-                "id": vid, "ref_path": str(ref_path), "ref_file": ref_path.name, "ref_text": text, "mode": best,
-                "similarity": sim, "scores": scores, "target_rms_db": ref_db,
-                "quality": quality, "trained_at": time.time(), "modes": sorted(set(ok_modes)),
-                "lang": "Chinese" if zh else "English", "workers": names,
-            }
-            (cur / "meta.json").write_text(
-                json.dumps({k: v for k, v in self.voice.items() if k != "ref_path"}, ensure_ascii=False), "utf-8"
-            )
-            self.fillers = []
-            self._set(state="done", stage="训练完成", progress=100, similarity=sim, mode=best, ref_text=text,
-                      elapsed=round(time.time() - self.job.get("started", time.time()), 1))
-            self._log("完成(%.1fs),选用模式 %s,相似度 %s" % (self.job["elapsed"], best, "%.2f%%" % (sim * 100) if sim is not None else "N/A"))
-            for w_ in self.ready_tts():  # 训练期间才加载完的卡:后台补上当前声音,双卡一起干活
-                if w_.name not in names:
-                    asyncio.create_task(self._prep_late(w_))
-            asyncio.create_task(self._make_fillers())  # 语气词缓存放后台,训练完立刻可用
-        except Exception as e:  # noqa: BLE001
-            msg = str(e).strip().splitlines()[-1] if str(e).strip() else repr(e)
-            self._set(state="error", stage="失败", error=msg)
-            self._log("失败: " + msg)
-            print(e, flush=True)
+        async def ensure(w):
+            i = self.tts.index(w)
+            if best in prepared.get(w.name, set()):
+                self._gpu_msg(i, 100, "完成")
+                return w.name
+            try:
+                self._gpu_msg(i, 92, "同步 %s 声纹" % best)
+                await w.call("prepare", _timeout=300, voice_id=vid, ref_path=str(ref_path), ref_text=text, modes=[best], warm=True)
+                self._gpu_msg(i, 100, "完成")
+                return w.name
+            except Exception as e:  # noqa: BLE001
+                self._log("%s 同步失败: %s" % (w.name, (str(e).strip().splitlines() or ["?"])[-1]))
+                return None
+
+        names = [n for n in await asyncio.gather(*[ensure(w) for w in tts_ws]) if n]
+        if not names:
+            raise RuntimeError("声音同步失败")
+        self.voice = {
+            "id": vid, "ref_path": str(ref_path), "ref_file": ref_path.name, "ref_text": text, "mode": best,
+            "similarity": sim, "scores": scores, "target_rms_db": ref_db,
+            "quality": quality, "trained_at": time.time(), "modes": sorted(set(ok_modes)),
+            "lang": "Chinese" if zh else "English", "workers": names,
+        }
+        (cur / "meta.json").write_text(
+            json.dumps({k: v for k, v in self.voice.items() if k != "ref_path"}, ensure_ascii=False), "utf-8"
+        )
+        self.fillers = []
+        self._set(state="done", stage="训练完成", progress=100, similarity=sim, mode=best, ref_text=text,
+                  elapsed=round(time.time() - self.job.get("started", time.time()), 1))
+        self._log("完成(%.1fs),选用模式 %s,相似度 %s" % (self.job["elapsed"], best, "%.2f%%" % (sim * 100) if sim is not None else "N/A"))
+        for w_ in self.ready_tts():  # 训练期间才加载完的卡:后台补上当前声音,双卡一起干活
+            if w_.name not in names:
+                asyncio.create_task(self._prep_late(w_))
+        asyncio.create_task(self._make_fillers())  # 语气词缓存放后台,训练完立刻可用
 
     # ---------- 语气词缓存 ----------
     async def _make_fillers(self):
@@ -637,11 +723,11 @@ class Engine:
         for w in self.tts:
             w.cancel.value = max(w.cancel.value, w.next_id - 1)
 
-    async def synth_collect(self, w: Worker, voice_id: str, text: str, lang: str, mode: str):
+    async def synth_collect(self, w: Worker, voice_id: str, text: str, lang: str, mode: str, chunk: int | None = None, stall: float = 90.0):
         """整句合成(训练评估/语气词缓存用):收集所有流式块 → (wav, sr)。"""
-        rid, q = w.submit("synth", voice_id=voice_id, text=text, lang=lang, mode=mode, chunk=config.TTS_CHUNK_NEXT)
+        rid, q = w.submit("synth", voice_id=voice_id, text=text, lang=lang, mode=mode, chunk=chunk or config.TTS_CHUNK_NEXT)
         parts, sr = [], config.SR
-        async for d in w.stream(rid, q):
+        async for d in w.stream(rid, q, stall=stall):
             parts.append(d["pcm"])
             sr = d["sr"]
         if not parts:
@@ -675,7 +761,11 @@ class Engine:
             w.cancel.value = max(w.cancel.value, rid)
             raise
         except Exception as e:  # noqa: BLE001
-            await out.put({"error": (str(e).strip().splitlines() or [repr(e)])[-1]})
+            if is_numeric_error(e):
+                asyncio.create_task(self._auto_downgrade())
+                await out.put({"error": "TTS 数值异常,已自动重启并切换精度(约 1~2 分钟),完成后请重新发送"})
+            else:
+                await out.put({"error": (str(e).strip().splitlines() or [repr(e)])[-1]})
         finally:
             w.busy_ms += (time.time() - t0) * 1000
             await out.put(None)
