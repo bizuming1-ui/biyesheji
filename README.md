@@ -1,4 +1,4 @@
-## biyesheji · 克隆语音系统 (Voice Clone Studio) v3
+## biyesheji · 克隆语音系统 (Voice Clone Studio) v5
 
 在 **Kaggle GPU T4 x2** 上部署的实时语音克隆 + 语音/文字对话系统。
 
@@ -53,13 +53,38 @@
   * 模拟器侧 3 秒心跳(延迟 / P95 / 丢包)、浏览器环境、GitHub 代码同步状态;可复制 / 下载 / 一键上传到 `logs/`。
 * 自检:`CLONE_MOCK=1 python tests/e2e_diag.py`
 
+## v5 改动(「点开始训练就失败」的根因修复 + 训练提速)
+
+### 根因
+
+Qwen3-TTS 声音克隆模型在 **T4(Turing 架构,没有原生 bf16)上用 float16 推理**时,logits 会出现 inf/NaN,采样处 `torch.multinomial`
+触发 CUDA 设备端断言:`probability tensor contains either inf, nan or element < 0` / `device-side assert triggered`
+(QwenLM/Qwen3-TTS issue #43)。旧版默认 `TTS_DTYPE=float16`,而这个错误恰好发生在训练的「提取声纹 / 合成校验句」里;
+旧版的回退逻辑只检查「输出音频是不是 NaN」,**抓不到这个异常**,而且 CUDA 断言之后整个 GPU 进程的上下文已经报废,只能重启进程。
+
+### 修复
+
+* 默认精度改为 **bfloat16**(faster-qwen3-tts 官方在 Tesla T4 上的基准 RTF≈0.93 用的就是 bf16)。
+* 新增 `server/errors.py`:识别数值异常 + 精度回退链 `float16 → bfloat16 → float32`。
+* 引擎(`engine.py`)遇到数值异常:**自动重启 TTS 进程 → 换更稳的精度 → 训练自动重试**(用户什么都不用做);
+  对话阶段遇到同样的异常也会后台自动降级。重启时旧的加载任务会作废,不会往新进程里塞第二次加载。
+* 训练任务持有强引用(防止被垃圾回收)、卡死的旧训练会被新训练取代(不再出现「训练正在进行中」永远点不了)。
+
+### 提速
+
+* 训练时只提取并缓存声纹,不再多合成一句「嗯。」预热(`prepare(warm=False)`);校验句缩短、流式块加大(`TRAIN_CHUNK=16`)。
+* 合成完最多再等 Whisper/相似度模型 30 秒(`TRAIN_AUX_WAIT`),识别文本最多等 90 秒(`TRAIN_ASR_WAIT`),不再被它们拖住。
+* 失败时界面直接显示真实原因和最近日志(不再只是一闪而过的提示)。
+* 自检:`CLONE_MOCK=1 python tests/e2e_numeric.py`(模拟 NaN 崩溃 → 自动降级 → 训练成功 → 对话可用)
+
 ## 文件
 
 ```
 server/        后端 (FastAPI + 多进程 GPU worker)
 web/index.html 前端(单屏,无需滚动)
 kaggle/run.py  Kaggle 启动器(装依赖/下载模型/起服务/建公网隧道/看门狗)
-tests/         Mock 端到端自检 (CLONE_MOCK=1, 不需要 GPU):e2e_mock / e2e_fail / e2e_diag
+tests/         Mock 端到端自检 (CLONE_MOCK=1, 不需要 GPU):e2e_mock / e2e_fail / e2e_diag / e2e_numeric
+server/errors.py  数值异常识别 + 精度回退链(v5)
 kaggle_all_in_one.py  粘贴到 Kaggle 单元格即可运行的完整脚本(内置以上全部文件)
 ```
 
@@ -75,6 +100,7 @@ kaggle_all_in_one.py  粘贴到 Kaggle 单元格即可运行的完整脚本(内�
 ```
 CLONE_MOCK=1 python tests/e2e_mock.py   # 主流程 + 断线续传 + DSP 音频检查
 CLONE_MOCK=1 python tests/e2e_fail.py   # 一张卡加载失败时的降级
+CLONE_MOCK=1 python tests/e2e_numeric.py # 训练根因:NaN 崩溃 → 自动降级精度 → 训练成功
 ```
 
 ## 关于指标的说明(请读)
