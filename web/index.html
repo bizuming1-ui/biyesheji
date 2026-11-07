@@ -268,6 +268,7 @@
 </div></div>
 <div id="toast"></div>
 
+<script src="/link.js"></script>
 <script src="/wsola.js"></script>
 <script src="/player.js"></script>
 <script>
@@ -293,9 +294,15 @@ const player = new GaplessPlayer(); window.player = player;
 let jobTimer = null;
 /* ---------------- 状态轮询 ---------------- */
 let STATUS = null;
+let pollBusy = false, pollFails = 0, chatBusy = 0;
 async function pollStatus() {
+  if (pollBusy) return; pollBusy = true;
+  const L = window.__LINK, t0 = performance.now();
   try {
-    const s = await (await jfetch("/api/status", {}, 8000)).json(); STATUS = s;
+    const r0 = await jfetch("/api/state", {}, 20000);
+    if (!r0.ok) throw new Error("HTTP " + r0.status);
+    const j0 = await r0.json(), s = j0.status; STATUS = s;
+    pollFails = 0; L.ok(performance.now() - t0); L.remember(j0); renderConn();
     if (s.job && s.job.state === "running" && !jobTimer) { $("train").disabled = true; startJobPoll(); }
     const w = s.workers, st = (n) => (w[n] ? w[n].state : "none");
     const ttsStates = Object.keys(w).filter((k) => k.startsWith("tts")).map(st);
@@ -321,9 +328,13 @@ async function pollStatus() {
       $("errtxt").textContent = "⚠ 模型加载失败 — " + errs.map(([k, x]) => k + ": " + last(x)).join(" | ");
       eb.classList.add("show");
     } else eb.classList.remove("show");
-  } catch (e) { /* 服务重启中 */ }
+  } catch (e) { pollFails++; L.fails++; renderConn(); L.maybeFailover(); }   // 服务重启中 / 网络抖动:退避重试
+  finally { pollBusy = false; }
 }
-setInterval(pollStatus, 3000); pollStatus();
+(function pollLoop() {   // 串行轮询:上一个请求结束才安排下一个,失败指数退避,隐藏页面/对话中降频
+  setTimeout(async () => { await pollStatus(); pollLoop(); }, window.__LINK.nextGap(pollFails, document.hidden, chatBusy));
+})();
+pollStatus();
 
 $("reload").onclick = async () => {
   try { const r = await (await fetch("/api/reload", { method: "POST" })).json(); toast("正在重新加载: " + (r.reloading || []).join(", "), 4000); pollStatus(); }
@@ -480,10 +491,11 @@ $("train").onclick = async () => {
   say("训练已启动 · 双卡准备中…", 14);
   startJobPoll();
 };
-function startJobPoll() { clearInterval(jobTimer); jobTimer = setInterval(pollJob, 800); pollJob(); }
+function startJobPoll() { clearInterval(jobTimer); jobTimer = setInterval(pollJob, 1500); pollJob(); }
 async function pollJob() {
+  if (pollJob.busy) return; pollJob.busy = true;
   try {
-    const j = await (await jfetch("/api/voice/job", {}, 8000)).json();
+    const j = await (await jfetch("/api/voice/job", {}, 15000)).json(); setConn(true);
     if (j.state === "idle") return;
     if (window.__vcEmit && pollJob.last !== j.state + "|" + j.stage) { pollJob.last = j.state + "|" + j.stage; window.__vcEmit({ kind: "train", msg: "训练 " + j.state + " · " + (j.stage || "") + " · " + (j.progress || 0) + "%" }); }
     $("pall").style.width = (j.progress || 0) + "%";
@@ -505,7 +517,7 @@ async function pollJob() {
         pollStatus();
       } else { toast("训练失败: " + j.error, 6000); }
     }
-  } catch (e) {}
+  } catch (e) {} finally { pollJob.busy = false; }
 }
 
 /* ---------------- HTTP 长轮询对话 ----------------
@@ -519,12 +531,19 @@ const SID = (() => {
   return s;
 })();
 let tSend = 0, curBubble = null, autoPlay = true, longMode = false, fillerOn = false, runId = 0, connFail = 0;
-function setConn(ok) {
+window.__linkNotify = (m) => { try { toast(m, 4500); } catch (e) {} };
+function setConn(ok) {   // v10: 成功才更新「最近一次联通」时间;单次失败不改指示灯
   connFail = ok ? 0 : connFail + 1;
-  const d = $("d-conn"); if (!d) return;
-  const good = ok || connFail < 2;
-  d.className = "dot " + (good ? "ok" : "err"); $("t-conn").textContent = good ? "已连接" : "重连中";
+  if (ok) window.__LINK.ok();
+  renderConn();
 }
+function renderConn() {
+  const d = $("d-conn"); if (!d) return;
+  const lv = window.__LINK.level(), rtt = window.__LINK.rtt;
+  d.className = "dot " + (lv === "ok" ? "ok" : lv === "warn" ? "load" : "err");
+  $("t-conn").textContent = lv === "ok" ? "已连接" + (rtt ? " · " + rtt + "ms" : "") + (window.__LINK.base ? " · 备用线" : "") : lv === "warn" ? "网络波动·自动重连" : "重连中";
+}
+setInterval(renderConn, 1000);
 async function jfetch(url, opt, timeoutMs) {
   const ac = new AbortController(), t = setTimeout(() => ac.abort(), timeoutMs || 20000);
   try { return await fetch(url, Object.assign({ cache: "no-store", signal: ac.signal }, opt || {})); } finally { clearTimeout(t); }
@@ -542,7 +561,7 @@ async function postRetry(url, body, tries) {
   throw new Error("无法连接服务器(已自动重试多次),请确认 Kaggle 单元格仍在运行");
 }
 /* 心跳:5 秒一次,仅用于显示连接状态 */
-setInterval(async () => { try { const r = await jfetch("/api/ping", {}, 6000); setConn(r.ok); } catch (e) { setConn(false); } }, 5000);
+/* v10: 不再有独立的 ping 定时器 —— /api/state 轮询(串行、带退避)就是心跳 */
 document.addEventListener("visibilitychange", () => { if (!document.hidden) pollStatus(); });
 
 function b64ToF32(b64) {
@@ -639,6 +658,10 @@ async function streamChat(body, my, bubble) {
   return st;
 }
 async function doChat(text, speak) {
+  chatBusy++;
+  try { return await doChatInner(text, speak); } finally { chatBusy = Math.max(0, chatBusy - 1); }
+}
+async function doChatInner(text, speak) {
   const my = ++runId;
   const bubble = curBubble = addMsg("a live", ""); tSend = performance.now();
   const body = { sid: SID, text, speak: !!speak, opts: { long: longMode, breath: $("breath").value / 100, filler: fillerOn } };
@@ -823,8 +846,11 @@ document.addEventListener("pointerdown", () => player.ctx && player.ctx.state !=
       : '<div class="ai bad">🔴 服务端无响应:无法读取 /api/diag(Kaggle 单元格是否仍在运行?隧道是否重建?)</div>';
   }
   async function refresh() {
+    refresh.busy = true; try { await refresh_(); } finally { refresh.busy = false; }
+  }
+  async function refresh_() {
     let d = null, err = "";
-    try { const r = await jfetch("/api/diag", {}, 12000); if (!r.ok) throw new Error("HTTP " + r.status); d = await r.json(); } catch (e) { err = String((e && e.message) || e); }
+    try { const r = await jfetch("/api/diag", {}, 25000); if (!r.ok) throw new Error("HTTP " + r.status); d = await r.json(); } catch (e) { err = String((e && e.message) || e); }
     LAST = { diag: d, client: clientSide(), err: err };
     LASTTXT = buildReport(d, LAST.client, err);
     renderAnalysis(d); $("logpre").textContent = LASTTXT;
@@ -832,7 +858,7 @@ document.addEventListener("pointerdown", () => player.ctx && player.ctx.state !=
   function fname(ext) { const t = new Date(), z = (n) => String(n).padStart(2, "0"); return "run-log-" + t.getFullYear() + z(t.getMonth() + 1) + z(t.getDate()) + "-" + z(t.getHours()) + z(t.getMinutes()) + z(t.getSeconds()) + "." + ext; }
   function dl(name, text, mime) { const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([text], { type: mime })); a.download = name; document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500); }
   async function copy(text) { try { await navigator.clipboard.writeText(text); return true; } catch (_) { const ta = document.createElement("textarea"); ta.value = text; ta.style.cssText = "position:fixed;opacity:0"; document.body.appendChild(ta); ta.select(); let ok = false; try { ok = document.execCommand("copy"); } catch (e) {} ta.remove(); return ok; } }
-  function open_() { $("logmodal").classList.add("show"); $("logpre").textContent = "加载中…"; refresh(); clearInterval(timer); timer = setInterval(() => { if ($("logauto").checked) refresh(); }, 3000); }
+  function open_() { $("logmodal").classList.add("show"); $("logpre").textContent = "加载中…"; refresh(); clearInterval(timer); timer = setInterval(() => { if ($("logauto").checked && !refresh.busy) refresh(); }, 8000); }
   function close_() { $("logmodal").classList.remove("show"); clearInterval(timer); }
   $("logbtn").onclick = open_; $("logclose").onclick = close_; $("logrefresh").onclick = refresh;
   $("logmodal").addEventListener("click", (e) => { if (e.target === $("logmodal")) close_(); });
