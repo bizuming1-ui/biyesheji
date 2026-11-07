@@ -91,6 +91,22 @@ Qwen3-TTS 声音克隆模型在 **T4(Turing 架构,没有原生 bf16)上用 floa
 * 自检:`python tests/e2e_deepseek.py`(假 DeepSeek + Mock TTS,覆盖 Key 校验/长文续写/429 重试/402/401/Key 不泄露)。
 * 语气词先行默认关闭(DeepSeek 首字常比语气词更慢,会造成语气词后的空档)。
 
+## v8 改动(首声最快 + 零停顿 + 歌曲参考音频 + 代码同步检测)
+
+### 实测日志里的真问题(logs/run-log-20261107-143559.txt)
+* 页面「首声 19.20s」≠ 服务端首声(1.4s)。差距来自:① 播放器为了「绝不断流」把合成速率≈实时的场景预缓冲到 8~14 秒(`node tests/player_sim.js` 在 v7 复现:1.0x → 首声 16.4s);② `POST /api/chat` 平均 4.6s、最大 8.7s(隧道 RTT≈400ms,POST→GET 两个往返 + 12 秒长轮询的批量到达);③ 音频走 JSON+base64(+33% 体积)。
+* 仍然「断流 1 次」:预缓冲只能赌估计,网络批量到达的抖动一大就断。
+* 参考音频是歌曲:Whisper 把歌词识别成乱码,ICL 相似度只有 55%,x-vector 96.6%、信噪比 18dB —— 伴奏被当成说话人特征克隆了。
+
+### 修复
+1. **弹性变速播放(`web/wsola.js` + `web/player.js`)**:第一性原理——不断流只要求「消耗速度 ≤ 生产速度」。缓冲不足时把播放速度 q 轻微降到 [0.87, 1](WSOLA,变速不变调,音色/谱包络不变);缓冲充足立刻回到 1.0(此时是逐采样精确重建,没有任何处理痕迹)。所需预缓冲由 `E_rem·(1/r−1)` 降为 `E_rem·(q_min/r−1)`,r≥0.87 时第一块到达即开播。仿真:1.0x 场景首声 16.4s → 2.0s;0.95x/180s 长文 15.9s → 5.9s;0 断流。`node tests/wsola_test.js` 验证:q=1 精确重建(误差 3e-8)、音高不变、无不连续、分块无关。
+2. **流式通道 `POST /api/chat_stream`**:一个请求「创建对话 + 实时推送」,二进制帧(无 base64,−25% 体积)、无轮询间隙、少 1~2 个往返;4 秒内收不到首帧 → 判定隧道缓冲了流式响应,自动退回长轮询;流中途断开 → 用 tid + 已收事件数无缝续传(不丢不重)。真实 Chromium 自检:`node tests/browser_stream.js`(正常 / 隧道缓冲 / 中途掐断三种场景)。
+3. **歌曲/带伴奏参考音频(`server/vocals.py` + `server/vocal_runner.py`)**:勾选「🎵 参考音频是歌曲」或信噪比 < 30dB 时,训练前先用 demucs(htdemucs)在 GPU1 子进程里抽出干净人声,再清洗、识别、克隆。失败自动沿用原音频,不影响训练。`REF_SEPARATE=auto|1|0`。
+4. 首声提示的 tooltip 现在拆开显示:点击→听到声音 / 首块音频到达 / 起播等待 / 通道类型,方便定位瓶颈。
+
+### 关于「98% 相似度」的说明(请读)
+界面上的相似度是 **WavLM 说话人嵌入余弦的真实测量值**,不会伪造。零样本克隆能否稳定到 98% 取决于参考音频质量与模型本身,没有任何代码能在没有 GPU 实测的情况下保证这个数字。v8 做的是**去掉已知的拉低因素**(伴奏/噪声/歌词乱码文本),训练后以界面真实数值为准;若低于目标,界面会如实提示。
+
 ## v6 改动(「点开始训练卡在『正在上传参考音频』」+ 运行日志)
 
 ### 根因
@@ -117,7 +133,7 @@ Qwen3-TTS 声音克隆模型在 **T4(Turing 架构,没有原生 bf16)上用 floa
 server/        后端 (FastAPI + 多进程 GPU worker)
 web/index.html 前端(单屏,无需滚动)
 kaggle/run.py  Kaggle 启动器(装依赖/下载模型/起服务/建公网隧道/看门狗)
-tests/         Mock 端到端自检 (CLONE_MOCK=1, 不需要 GPU):e2e_mock / e2e_fail / e2e_diag / e2e_numeric
+tests/         Mock 端到端自检 (CLONE_MOCK=1, 不需要 GPU):e2e_mock / e2e_fail / e2e_diag / e2e_numeric / e2e_stream;JS: player_sim / wsola_test / browser_stream
 server/errors.py  数值异常识别 + 精度回退链(v5)
 server/perf.py + uploads.py  性能剖析/瓶颈分析 + 分块上传(v6)
 tools/build_all_in_one.py  重新生成 kaggle_all_in_one.py
