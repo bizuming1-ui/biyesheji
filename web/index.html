@@ -224,6 +224,7 @@
       <input type="file" id="file" accept="audio/*,video/*" hidden />
       <audio id="preview" controls style="display:none"></audio>
       <textarea class="t" id="reftext" rows="2" placeholder="参考文本(留空 = 自动识别,推荐)"></textarea>
+      <label style="display:flex;gap:8px;align-items:center;font-size:12px;color:var(--mut);cursor:pointer" title="参考音频是歌曲/带伴奏/背景音乐时勾选:训练前先用 demucs 分离出干净人声(信噪比低时也会自动分离)"><input type="checkbox" id="isSong"> 🎵 参考音频是歌曲 / 带伴奏(先分离人声)</label>
       <button class="btn pri" id="train" style="padding:12px;font-size:15px" disabled>🚀 开始训练(双卡同时)</button>
       <div class="prog"><i id="pall"></i></div>
       <div class="gpuline" id="gl"></div>
@@ -277,6 +278,7 @@
 </div></div>
 <div id="toast"></div>
 
+<script src="/wsola.js"></script>
 <script src="/player.js"></script>
 <script>
 "use strict";
@@ -500,13 +502,13 @@ $("train").onclick = async () => {
   say("上传完成 · 正在启动训练…", 12);
   let r = null, last = "";
   if (legacy) {  // 旧版服务端(没有分块接口):退回一次性上传
-    const fd = new FormData(); fd.append("file", prep.blob, prep.name); fd.append("text", text); fd.append("lang", lang);
+    const fd = new FormData(); fd.append("file", prep.blob, prep.name); fd.append("text", text); fd.append("lang", lang); fd.append("song", $("isSong").checked ? "1" : "0");
     for (let i = 0; i < 4 && !r; i++) { try { r = await jfetch("/api/voice/train", { method: "POST", body: fd }, 90000); } catch (e) { await sleep(800 * (i + 1)); } }
   } else {
     for (let round = 0; round < 3 && !(r && r.ok); round++) {
       for (let i = 0; i < 6; i++) {
         try {
-          r = await jfetch("/api/voice/train_uploaded", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ uid: up.uid, total: up.total, text: text, lang: lang }) }, 20000);
+          r = await jfetch("/api/voice/train_uploaded", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ uid: up.uid, total: up.total, text: text, lang: lang, song: $("isSong").checked }) }, 20000);
           break;
         } catch (e) { r = null; await sleep(600 * (i + 1)); }
       }
@@ -591,7 +593,12 @@ function b64ToF32(b64) {
   return f;
 }
 player.onstate = (s) => { $("pstate").textContent = { idle: "待机", playing: "● 正在朗读", buffering: "缓冲中…" }[s] || s; $("pstate").style.color = s === "playing" ? "var(--ok)" : "var(--mut)"; };
-player.onfirst = (now, lead) => { const ms = now - tSend + lead * 1000; $("ttfa").textContent = (ms / 1000).toFixed(2) + "s"; $("ttfa").style.color = ms < 3000 ? "var(--ok)" : "var(--warn)"; };
+player.onfirst = (now, lead) => {
+  const ms = now - tSend + lead * 1000;
+  $("ttfa").textContent = (ms / 1000).toFixed(2) + "s"; $("ttfa").style.color = ms < 3000 ? "var(--ok)" : "var(--warn)";
+  const arr = player.firstArriveAt ? player.firstArriveAt - tSend : 0;   // 首个音频块到达浏览器的时刻 = 网络+LLM+TTS 的真实下限
+  $("ttfa").title = "点击发送 → 听到声音 " + (ms / 1000).toFixed(2) + "s(其中首块音频到达 " + (arr / 1000).toFixed(2) + "s,起播等待 " + ((ms - arr) / 1000).toFixed(2) + "s)· 通道 " + (streamMode ? "流式" : "长轮询");
+};
 function scrollDown() { const m = $("msgs"); m.scrollTop = m.scrollHeight; }
 function addMsg(cls, text) {
   const m = $("msgs"); const e = m.querySelector(".empty"); if (e) e.remove();
@@ -613,18 +620,89 @@ function handleEvent(m, bubble) {
   else if (m.type === "done") {
     player.finish(m.stats.chunks);
     const g = m.stats.gpu_chunks || {}; const gs = Object.keys(g).sort().map((k) => k.toUpperCase() + "×" + g[k]).join(" ");
-    $("ttfa").title = "服务端首声 " + m.stats.ttfa_ms + "ms · LLM首字 " + m.stats.llm_first_ms + "ms · " + gs;
+    $("ttfa").title += " · 服务端首声 " + m.stats.ttfa_ms + "ms · LLM首字 " + m.stats.llm_first_ms + "ms · " + gs;
     if (m.stats.chunks) addMsg("s", `音频 ${m.stats.audio_s}s · 首声 ${((m.stats.ttfa_ms || 0) / 1000).toFixed(2)}s · 正文首声 ${((m.stats.body_ttfa_ms || 0) / 1000).toFixed(2)}s · ${gs}· 预缓冲 ${player.prebufferS.toFixed(1)}s${player.underruns ? " · 断流" + player.underruns + "次(已自适应加大缓冲)" : " · 播放零断流"}`);
   } else if (m.type === "stopped") { player.stop(); }
 }
 
+/* ---- v8 流式通道:一个 POST 同时「创建对话 + 推送事件」(二进制帧,无 base64,无轮询间隙)。
+   Cloudflare 免费隧道可能缓冲流式响应 → 4 秒内收不到 hello 帧就判定「流式不可用」,本页后续自动改用长轮询(并记住)。
+   流中途断开:用 hello 里的 tid + 已收事件数作为游标,无缝回退到 /api/events,不丢不重。 */
+let streamMode = (function () { try { return localStorage.getItem("vc_stream") !== "0"; } catch (e) { return true; } })();
+function rememberStream(ok) { streamMode = ok; try { localStorage.setItem("vc_stream", ok ? "1" : "0"); } catch (e) {} }
+function stopOldStream() { if (window._streamAC) { try { window._streamAC.abort(); } catch (e) {} window._streamAC = null; } }
+function dispatchFrame(kind, view, bytes, bubble) {
+  if (kind === 1) {   // 音频:turn,idx,sr(大端 u32) + PCM16 小端
+    const turn = view.getUint32(0), idx = view.getUint32(4), sr = view.getUint32(8);
+    const n = (bytes.length - 12) >> 1, f = new Float32Array(n), dv = new DataView(bytes.buffer, bytes.byteOffset + 12, n * 2);
+    for (let i = 0; i < n; i++) f[i] = dv.getInt16(2 * i, true) / 32768;
+    if (autoPlay) player.push(turn, idx, sr, f);
+    return true;
+  }
+  if (kind === 0) { handleEvent(JSON.parse(new TextDecoder().decode(bytes)), bubble); return true; }
+  return false;
+}
+/* 返回 {tid, got, done, failed}。got = 已处理的事件数(= 回退到长轮询的游标) */
+async function streamChat(body, my, bubble) {
+  const ac = new AbortController(); stopOldStream(); window._streamAC = ac;
+  const st = { tid: null, got: 0, done: false, failed: false, helloAt: 0 };
+  let helloTimer = setTimeout(() => { if (!st.helloAt) { st.failed = true; st.noHello = true; ac.abort(); } }, 4000);   // 隧道缓冲流式响应时,连响应头都不会到:必须在 fetch 之前就开始计时
+  try {
+    const r = await fetch("/api/chat_stream", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: ac.signal, cache: "no-store" });
+    if (!r.ok) { const e = new Error("HTTP " + r.status); e.status = r.status; throw e; }
+    const rd = r.body.getReader();
+    let buf = new Uint8Array(0);
+    for (;;) {
+      const { value, done } = await rd.read();
+      if (done) break;
+      if (my !== runId) { ac.abort(); return st; }
+      const nb = new Uint8Array(buf.length + value.length); nb.set(buf, 0); nb.set(value, buf.length); buf = nb;
+      let off = 0;
+      while (buf.length - off >= 5) {
+        const dv0 = new DataView(buf.buffer, buf.byteOffset + off, 5);
+        const kind = dv0.getUint8(0), len = dv0.getUint32(1);
+        if (buf.length - off - 5 < len) break;
+        const payload = buf.subarray(off + 5, off + 5 + len);
+        off += 5 + len;
+        if (kind === 2) { st.helloAt = performance.now(); st.tid = JSON.parse(new TextDecoder().decode(payload)).tid; clearTimeout(helloTimer); }
+        else if (kind === 3) { /* 心跳 */ }
+        else if (kind === 4) { st.done = true; }
+        else { try { dispatchFrame(kind, new DataView(payload.buffer, payload.byteOffset, payload.byteLength), payload, bubble); } catch (e) { console.error(e); } st.got++; }
+      }
+      buf = buf.slice(off);
+      setConn(true);
+      if (st.done) break;
+    }
+    if (!st.done) st.failed = true;   // 连接提前结束
+  } catch (e) {
+    if (my !== runId) return st;
+    st.failed = true; st.err = e;
+    if (e && e.status >= 400 && e.status < 500 && e.status !== 404) st.fatal = e;
+  } finally { clearTimeout(helloTimer); }
+  return st;
+}
 async function doChat(text, speak) {
   const my = ++runId;
   const bubble = curBubble = addMsg("a live", ""); tSend = performance.now();
-  let tid;
-  try { tid = (await postRetry("/api/chat", { sid: SID, text, speak: !!speak, opts: { long: longMode, breath: $("breath").value / 100, filler: fillerOn, ds: dsCfg() } })).tid; }
-  catch (e) { if (my === runId) { endBubble(); addMsg("e", "⚠ 发送失败:" + e.message); } return; }
-  let after = 0, fails = 0, lastAct = performance.now();
+  const body = { sid: SID, text, speak: !!speak, opts: { long: longMode, breath: $("breath").value / 100, filler: fillerOn, ds: dsCfg() } };
+  let tid = null, after = 0;
+  if (streamMode) {
+    const st = await streamChat(body, my, bubble);
+    if (my !== runId) return;
+    if (st.done) { try { localStorage.setItem("vc_nohello", "0"); } catch (e) {} endBubble(); return; }
+    if (st.fatal) { endBubble(); addMsg("e", "⚠ 发送失败:" + st.fatal.message); return; }
+    if (st.tid) { tid = st.tid; after = st.got; toast("流式连接中断,已无缝切换到长轮询续传", 2500); }   // 已创建对话 → 用游标续传
+    else if (st.err && st.err.status === 404) { rememberStream(false); }
+    else if (st.noHello) {   // 连续 2 次 4 秒内收不到首帧 → 判定隧道缓冲了流式响应,之后改用长轮询(1 次可能只是网络慢,不下结论)
+      let n = 0; try { n = +(localStorage.getItem("vc_nohello") || 0) + 1; localStorage.setItem("vc_nohello", String(n)); } catch (e) {}
+      if (n >= 2) { rememberStream(false); toast("此网络不支持流式推送,已自动改用长轮询(仍然可用)", 3500); }
+    }
+  }
+  if (tid === null) {
+    try { tid = (await postRetry("/api/chat", body)).tid; }
+    catch (e) { if (my === runId) { endBubble(); addMsg("e", "⚠ 发送失败:" + e.message); } return; }
+  }
+  let fails = 0, lastAct = performance.now();
   while (my === runId) {
     let j;
     try {
@@ -660,7 +738,7 @@ function sendChat(text) {
 $("send").onclick = () => { const v = $("input").value; if (sendChat(v)) $("input").value = ""; };
 $("input").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.isComposing) $("send").click(); });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") $("stop").click(); });
-$("stop").onclick = () => { runId++; send({ type: "stop" }); player.stop(); endBubble(); };
+$("stop").onclick = () => { runId++; stopOldStream(); send({ type: "stop" }); player.stop(); endBubble(); };
 $("reset").onclick = () => { runId++; send({ type: "reset" }); player.stop(); endBubble(); $("msgs").innerHTML = ""; addMsg("s", "已开始新对话"); };
 const tgl = (id, cb) => { const e = $(id); e.onclick = (ev) => { if (ev.target.tagName === "INPUT") return; e.classList.toggle("on"); cb(e.classList.contains("on")); }; };
 tgl("tgAuto", (v) => { autoPlay = v; if (!v) player.stop(); }); tgl("tgLong", (v) => (longMode = v)); tgl("tgSmooth", (v) => (player.smooth = v)); tgl("tgFiller", (v) => (fillerOn = v));
