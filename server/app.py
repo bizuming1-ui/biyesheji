@@ -15,7 +15,9 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, Web
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 
-from . import config, diag
+import time
+
+from . import config, diag, perf, uploads
 from .engine import Engine, pack_audio
 
 diag.install()  # 把服务端日志同时复制进检测日志缓冲(输出框照常显示)
@@ -100,7 +102,10 @@ async def favicon():
 
 @app.post("/api/voice/train")
 async def train(file: UploadFile = File(...), text: str = Form(""), lang: str = Form("zh")):
+    """旧接口(一次性上传整个文件)。保留兼容;新前端走下面的分块上传。"""
+    t0 = time.perf_counter()
     data = await file.read()
+    perf.record("upload/oneshot_read", time.perf_counter() - t0)
     if len(data) < 2000:
         raise HTTPException(400, "音频文件为空或太小")
     try:
@@ -108,6 +113,53 @@ async def train(file: UploadFile = File(...), text: str = Form(""), lang: str = 
     except RuntimeError as e:
         raise HTTPException(409, str(e))
     return {"ok": True}
+
+
+# ---------------------------------------------------------------- v6: 分块上传(隧道友好,断点续传)
+@app.post("/api/voice/chunk")
+async def voice_chunk(request: Request, uid: str, idx: int, total: int):
+    t0 = time.perf_counter()
+    data = await request.body()
+    try:
+        r = uploads.put_chunk(uid, idx, total, data)
+    except uploads.UploadError as e:
+        raise HTTPException(400, str(e))
+    perf.record("upload/chunk_recv", time.perf_counter() - t0)
+    return {"ok": True, **r}
+
+
+@app.get("/api/voice/chunk_status")
+async def voice_chunk_status(uid: str):
+    return uploads.status(uid)
+
+
+@app.post("/api/voice/train_uploaded")
+async def train_uploaded(request: Request):
+    """所有分块到齐后调用:体积很小的请求,真正开始训练。幂等:响应丢了重发同一个 uid 也不会重复训练。"""
+    body = await request.json()
+    uid = str(body.get("uid") or "")
+    total = int(body.get("total") or 0)
+    if uid and uid == getattr(engine, "last_train_uid", None) and engine.job.get("state") in ("running", "done"):
+        return {"ok": True, "dup": True}
+    t0 = time.perf_counter()
+    data, missing = uploads.assemble(uid, total)
+    if data is None:
+        return JSONResponse({"detail": "分块未到齐", "missing": missing}, status_code=422)
+    perf.record("upload/assemble", time.perf_counter() - t0)
+    if len(data) < 2000:
+        raise HTTPException(400, "音频文件为空或太小")
+    try:
+        await engine.start_training(data, str(body.get("text") or ""), str(body.get("lang") or "zh"))
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
+    engine.last_train_uid = uid
+    uploads.drop(uid)
+    return {"ok": True, "bytes": len(data)}
+
+
+@app.get("/api/perf")
+async def perf_snapshot():
+    return {"summary": perf.summary(), "recent": perf.recent(120)}
 
 
 @app.get("/api/voice/job")
