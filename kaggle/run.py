@@ -3,6 +3,7 @@
 流程: 检查双卡 → 装依赖 → 并行预下载模型 → 启动服务 → 建立公网隧道 → 在输出框打印可点击网址。
 用法(Kaggle 单元格):  !python /kaggle/working/clone-system/kaggle/run.py
 """
+import json
 import os
 import re
 import shutil
@@ -178,6 +179,7 @@ def kill_stale():
     """重复运行单元格时,上一次遗留的服务/隧道进程还占着端口和显存,必须先清掉。"""
     sh("pkill -f 'uvicorn server.app' || true", check=False)
     sh("pkill -f cloudflared || true", check=False)
+    sh("pkill -f 'free.pinggy.io' || true; pkill -f 'nokey@localhost.run' || true", check=False)
     sh("(fuser -k %d/tcp > /dev/null 2>&1) || true" % PORT, check=False)
     time.sleep(3)
     try:
@@ -293,11 +295,95 @@ def start_ngrok():
     return ngrok.connect(PORT, "http").public_url
 
 
+# ---------------------------------------------------------------- v10: 双线路 + 线路地址发布
+# 免费公网隧道(trycloudflare)没有 SLA,偶尔会整条卡住几十秒。第一性原理:单线路不可能「不断连」,
+# 只能用冗余:主线路 cloudflared(http2)+ 备用线路(pinggy / localhost.run,走 SSH:443)同时在线,
+# 全部地址写进 TUN_FILE,服务端经 /api/state 下发给页面和浏览器模拟器,主线路卡死时它们自动切换。
+TUN_FILE = Path(os.environ.get("CLONE_TUNNEL_FILE", "/tmp/clone_tunnels.json"))
+_PUB = {"primary": None, "urls": []}
+_SEC = {"proc": None, "url": None, "name": None, "busy": False}
+SSH_BASE = ["ssh", "-T", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=3", "-o", "ExitOnForwardFailure=yes", "-o", "ConnectTimeout=15"]
+
+
+def publish(primary=None, sec=None):
+    if primary is not None:
+        _PUB["primary"] = primary
+    if sec is not None:
+        _SEC["url"] = sec or None
+    urls = [u for u in (_PUB["primary"], _SEC["url"]) if u]
+    _PUB["urls"] = urls
+    try:
+        TUN_FILE.write_text(json.dumps({"primary": _PUB["primary"], "urls": urls, "t": time.time()}), "utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _ssh_tunnel(name, cmd, rx, wait=40):
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    found = {}
+
+    def rd():
+        for line in iter(p.stdout.readline, ""):
+            m = re.search(rx, line)
+            if m and "url" not in found:
+                found["url"] = m.group(0)
+
+    threading.Thread(target=rd, daemon=True).start()
+    for _ in range(wait):
+        if "url" in found:
+            return p, found["url"]
+        if p.poll() is not None:
+            break
+        time.sleep(1)
+    try:
+        p.kill()
+    except Exception:  # noqa: BLE001
+        pass
+    return None, None
+
+
+def start_secondary():
+    """备用线路(后台线程运行,不拖慢主线路出网址)。成功返回网址,并写入 TUN_FILE。"""
+    if _SEC["busy"]:
+        return None
+    _SEC["busy"] = True
+    try:
+        if not shutil.which("ssh"):
+            sh("(apt-get install -y -qq openssh-client > /dev/null 2>&1) || true", check=False)
+        if not shutil.which("ssh"):
+            log("备用线路需要 ssh,当前环境没有,跳过(主线路不受影响)")
+            return None
+        old = _SEC.get("proc")
+        if old and old.poll() is None:
+            old.kill()
+        for name, cmd, rx in (
+            # pinggy 实测输出: https://xxx.free.pinggy.net(正则不能匹配到 dashboard.pinggy.io)
+            ("pinggy", SSH_BASE + ["-p", "443", "-R0:127.0.0.1:%d" % PORT, "free.pinggy.io"], r"https://[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:free\.pinggy\.(?:net|link)|pinggy-free\.link)"),
+            ("localhost.run", SSH_BASE + ["-R", "80:127.0.0.1:%d" % PORT, "nokey@localhost.run"], r"https://[a-z0-9]+\.lhr\.life"),
+        ):
+            try:
+                proc, url = _ssh_tunnel(name, cmd, rx)
+            except Exception as e:  # noqa: BLE001
+                log("备用线路 %s 失败: %s" % (name, e))
+                continue
+            if url and url != _PUB["primary"]:
+                _SEC.update(proc=proc, name=name)
+                publish(sec=url)
+                log("✓ 备用线路就绪 (%s): %s   (主线路卡死时页面会自动切换,无需操作)" % (name, url))
+                return url
+        log("备用线路暂时不可用,稍后看门狗会自动重试(主线路不受影响)")
+        return None
+    finally:
+        _SEC["busy"] = False
+
+
 def banner(url):
     line = "=" * 74
     print("\n" + line)
     print("  ✅ 克隆语音系统已就绪,请打开下面的网址(粘贴到「浏览器模拟器」地址栏即可):")
     print("\n      " + url + "\n")
+    print("  🛟 备用线路会在后台自动建立并写入页面(主线路卡死时自动切换);浏览器模拟器会同步感知")
     print("  🔎 检测日志(完整参数):" + url + "/api/diag   (浏览器模拟器右上角「检测日志」会自动读取)")
     print(line + "\n", flush=True)
     try:
@@ -320,6 +406,12 @@ def open_tunnel():
     return None
 
 
+def _probe_ms(url, timeout=10):
+    t0 = time.time()
+    ok = tunnel_ok(url, timeout)
+    return ok, (time.time() - t0) * 1000
+
+
 def main():
     log("工作目录:", ROOT)
     load_secrets()
@@ -328,36 +420,66 @@ def main():
         kill_stale()
         install_deps()
         predownload()
+    try:
+        TUN_FILE.unlink()
+    except Exception:  # noqa: BLE001
+        pass
     server = start_server()
     url = open_tunnel()
     if url:
+        publish(primary=url)
         banner(url)
+        threading.Thread(target=start_secondary, daemon=True).start()
     else:
         log("⚠ 未能建立公网隧道。可在 Kaggle Secrets 添加 NGROK_TOKEN 后重试。")
-    # ---- 看门狗:服务进程/公网隧道任何一个挂了都自动拉起,保证「一直连得上」 ----
-    bad = 0
+    # ---- 看门狗(v10:10 秒一次):服务进程 / 主线路 / 备用线路任何一个挂了都自动拉起 ----
+    bad, sec_bad, n, lat, fail_total, t_log = 0, 0, 0, [], 0, time.time()
     try:
         while True:
-            time.sleep(20)
+            time.sleep(10)
             if server.poll() is not None:
                 log("⚠ 服务进程退出(code=%s),正在重启 …" % server.returncode)
                 server = start_server()
                 bad = 0
                 continue
-            if not url:
-                continue
-            if tunnel_ok(url):
-                bad = 0
-                continue
-            bad += 1
-            log("⚠ 公网隧道检测失败 (%d/3)" % bad)
-            if bad >= 3:
-                log("重建公网隧道 …(网址会变化,请使用下面的新网址)")
-                new = open_tunnel()
-                if new:
-                    url = new
-                    banner(url)
-                bad = 0
+            if url:
+                ok, ms = _probe_ms(url)
+                n += 1
+                if ok:
+                    bad = 0
+                    lat = (lat + [ms])[-60:]
+                else:
+                    bad += 1
+                    fail_total += 1
+                    log("⚠ 主线路探测失败 (%d/3)" % bad)
+                    if bad >= 3:
+                        log("重建主线路 …(网址会变化;备用线路/页面会自动获知新网址)")
+                        new = open_tunnel()
+                        if new:
+                            url = new
+                            publish(primary=url)
+                            banner(url)
+                        bad = 0
+            # 备用线路:进程退出或探测连续 3 次失败 → 后台重建
+            su = _SEC.get("url")
+            if su and not _SEC["busy"]:
+                sp = _SEC.get("proc")
+                dead = (sp is not None and sp.poll() is not None)
+                if not dead and n % 3 == 0:
+                    dead = not tunnel_ok(su, 10)
+                    sec_bad = sec_bad + 1 if dead else 0
+                    dead = dead and sec_bad >= 3
+                if dead:
+                    sec_bad = 0
+                    publish(sec="")
+                    threading.Thread(target=start_secondary, daemon=True).start()
+            elif url and not su and not _SEC["busy"] and n % 6 == 0:
+                threading.Thread(target=start_secondary, daemon=True).start()
+            if time.time() - t_log > 600 and lat:   # 每 10 分钟一行真实统计(服务端到公网隧道的往返)
+                sl = sorted(lat)
+                log("运行正常 · 主线路探测 %d 次,失败 %d 次,延迟均值 %.0fms / P95 %.0fms · 备用线路: %s" % (
+                    n, fail_total, sum(lat) / len(lat), sl[int(len(sl) * 0.95) - 1 if len(sl) > 1 else 0], _SEC.get("url") or "无"))
+                t_log = time.time()
     except KeyboardInterrupt:
         server.terminate()
 
