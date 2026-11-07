@@ -15,7 +15,6 @@ import numpy as np
 
 from . import audio_utils as au
 from . import config, perf, vocals
-from . import deepseek as ds
 from .errors import NumericError, is_numeric_error, next_dtype
 from .text_chunker import SentenceChunker, clean_for_tts, detect_language, is_speakable
 
@@ -249,45 +248,7 @@ class Engine:
         self.fillers: list[dict] = []
         self._last_filler = -1
         self.sessions: dict[str, Session] = {}
-        # v7: 对话大模型改为 DeepSeek API。Key 只在内存里,绝不写盘/写日志/出现在任何接口响应里
-        self.ds: dict = {"key": "", "model": "", "thinking": False, "state": "nokey", "error": "", "models": [], "latency_ms": None}
         self.speech_rate = {"Chinese": 0.20, "English": 0.075, "Japanese": 0.18, "Korean": 0.17}  # 秒/字符,训练后按真实合成结果自适应
-
-    # ---------- DeepSeek ----------
-    def ds_public(self) -> dict:
-        d = self.ds
-        key = d["key"]
-        return {
-            "state": d["state"], "error": d["error"], "model": d["model"] or ds.DEFAULT_MODEL, "thinking": d["thinking"],
-            "models": d["models"], "latency_ms": d["latency_ms"], "has_key": bool(key),
-            "key_hint": ("…" + key[-4:]) if len(key) >= 8 else "",
-        }
-
-    async def ds_configure(self, key: str, model: str = "", thinking: bool = False) -> dict:
-        key = (key or "").strip()
-        self.ds["thinking"] = bool(thinking)
-        try:
-            info = await ds.client.check(key)
-        except ds.DeepSeekError as e:
-            self.ds.update(state="error", error=str(e))
-            raise
-        self.ds["key"] = key
-        models = info["models"]
-        chosen = model if (model and (not models or model in models)) else info["best"]
-        self.ds.update(state="ok", error="", model=chosen, models=models, latency_ms=info["latency_ms"])
-        return self.ds_public()
-
-    def ds_resolve(self, opts: dict) -> dict:
-        d = dict(opts.get("ds") or {})
-        key = str(d.get("key") or "").strip()
-        if key and key != self.ds["key"]:
-            self.ds["key"] = key
-            self.ds["state"] = "ok"
-        return {
-            "key": key or self.ds["key"],
-            "model": str(d.get("model") or self.ds["model"] or ds.DEFAULT_MODEL),
-            "thinking": bool(d.get("thinking", self.ds["thinking"])),
-        }
 
     def est_audio_s(self, text: str) -> float:
         return len(text) * self.speech_rate.get(detect_language(text), 0.2)
@@ -309,9 +270,8 @@ class Engine:
         tts_gpus = [0, 1] if n >= 2 else [0]
         for i, g in enumerate(tts_gpus):
             self.tts.append(Worker("tts%d" % i, "tts", g, self.loop))
-        # 对话模型按层均分到两张卡("0,1"),避免 GPU0 同时放 TTS+整个 LLM 而 OOM
-        if not config.USE_DEEPSEEK:  # v7: 默认不再加载本地 LLM(省下约 7.5GiB 显存和几分钟加载时间)
-            self.llm = Worker("llm", "llm", "0,1" if (n >= 2 and config.LLM_SPLIT) else 0, self.loop)
+        # v9: 对话大模型直接部署在 Kaggle 上,按层均分到两张卡("0,1"),避免 GPU0 同时放 TTS+整个 LLM 而 OOM
+        self.llm = Worker("llm", "llm", "0,1" if (n >= 2 and config.LLM_SPLIT) else 0, self.loop)
         self.aux = Worker("aux", "aux", 1 if n >= 2 else 0, self.loop)
         for w in self.workers:
             w.start()
@@ -477,8 +437,7 @@ class Engine:
             "job": self.job,
             "turn": self.turn_stats,
             "fillers": len(self.fillers),
-            "models": {"tts": config.TTS_MODEL, "llm": ("DeepSeek · " + (self.ds["model"] or ds.DEFAULT_MODEL)) if config.USE_DEEPSEEK else config.LLM_MODEL, "asr": config.ASR_MODEL},
-            "deepseek": self.ds_public(),
+            "models": {"tts": config.TTS_MODEL, "llm": config.LLM_MODEL, "asr": config.ASR_MODEL},
             "code_version": config.CODE_VERSION,
         }
 
@@ -1063,68 +1022,36 @@ class Engine:
                 if long_mode:
                     msgs[0]["content"] += "\n本次请尽可能详尽、完整、有层次地长篇回答。"
                 full = []
-                if config.USE_DEEPSEEK:
-                    dsc = self.ds_resolve(opts)
-                    thinking = dsc["thinking"]
-                    gen = ds.client.stream(dsc["key"], msgs, dsc["model"], thinking, max_new)
-                    it = gen.__aiter__()
-                    think_sent = False
-                    try:
-                        while True:
-                            limit = config.LLM_STALL_TIMEOUT if full else config.LLM_FIRST_TOKEN_TIMEOUT * (2 if thinking else 1)
-                            try:
-                                kind, piece = await asyncio.wait_for(it.__anext__(), limit)
-                            except StopAsyncIteration:
-                                break
-                            except asyncio.TimeoutError:
-                                raise RuntimeError("DeepSeek %d 秒内没有返回内容(网络或服务繁忙),请重试" % limit)
-                            if kind == "think":
-                                if not think_sent:
-                                    think_sent = True
-                                    await emit_json({"type": "think"})
-                                continue
-                            if kind == "cont":
-                                await emit_json({"type": "cont", "round": int(piece)})
-                                continue
-                            if stats["llm_first_ms"] is None:
-                                stats["llm_first_ms"] = round((time.time() - t0) * 1000)
-                            full.append(piece)
-                            await emit_json({"type": "text", "delta": piece})
-                            n_before = n_sub
-                            for p in chunker.feed(piece):
-                                submit(p)
-                            if n_sub != n_before:
-                                await emit_json({"type": "plan", "est_s": round(est_total[0], 2)})
-                    finally:
-                        try:
-                            await gen.aclose()
-                        except Exception:  # noqa: BLE001
-                            pass
-                        if full:
-                            sess.history.append({"role": "assistant", "content": "".join(full)})
-                            sess.trim()
-                        elif sess.history and sess.history[-1]["role"] == "user":
-                            sess.history.pop()
-                else:
-                    if self.llm is None or self.llm.state != "ready":
-                        detail = (self.llm.error or "") if self.llm else ""
-                        raise RuntimeError("对话模型尚未加载完成或加载失败。" + (detail.strip().splitlines()[-1] if detail.strip() else "请稍候或查看 Kaggle 输出日志"))
-                    rid, q = self.llm.submit("chat", messages=msgs, max_new_tokens=max_new)
-                    sess.llm_rid = rid
-                    try:
-                        async for delta in self.llm.stream(rid, q, stall=config.LLM_FIRST_TOKEN_TIMEOUT + 30):
-                            if stats["llm_first_ms"] is None:
-                                stats["llm_first_ms"] = round((time.time() - t0) * 1000)
-                            full.append(delta)
-                            await emit_json({"type": "text", "delta": delta})
-                            for p in chunker.feed(delta):
-                                submit(p)
-                    finally:
-                        if full:
-                            sess.history.append({"role": "assistant", "content": "".join(full)})
-                            sess.trim()
-                        elif sess.history and sess.history[-1]["role"] == "user":
-                            sess.history.pop()
+                if self.llm is not None and self.llm.state == "loading":
+                    await emit_json({"type": "warn", "text": "对话模型正在加载到显存,加载完会自动开始回答…"})
+                    t_wait = time.time()
+                    while self.llm.state == "loading" and time.time() - t_wait < config.LLM_LOAD_WAIT:
+                        await asyncio.sleep(0.5)
+                if self.llm is None or self.llm.state != "ready":
+                    detail = (self.llm.error or "") if self.llm else ""
+                    raise RuntimeError("对话模型尚未加载完成或加载失败。" + (detail.strip().splitlines()[-1] if detail.strip() else "请稍候或查看 Kaggle 输出日志"))
+                rid, q = self.llm.submit("chat", messages=msgs, max_new_tokens=max_new)
+                sess.llm_rid = rid
+                try:
+                    async for delta in self.llm.stream(rid, q, stall=config.LLM_FIRST_TOKEN_TIMEOUT + 30):
+                        if delta.startswith(config.LLM_CONT_MARK):  # 一轮 token 用完,worker 已自动续写下一轮
+                            await emit_json({"type": "cont", "round": int(delta[len(config.LLM_CONT_MARK):] or 2)})
+                            continue
+                        if stats["llm_first_ms"] is None:
+                            stats["llm_first_ms"] = round((time.time() - t0) * 1000)
+                        full.append(delta)
+                        await emit_json({"type": "text", "delta": delta})
+                        n_before = n_sub
+                        for p in chunker.feed(delta):
+                            submit(p)
+                        if n_sub != n_before:  # 每多一句就更新「预计总音频时长」,播放器据此决定缓冲/变速
+                            await emit_json({"type": "plan", "est_s": round(est_total[0], 2)})
+                finally:
+                    if full:
+                        sess.history.append({"role": "assistant", "content": "".join(full)})
+                        sess.trim()
+                    elif sess.history and sess.history[-1]["role"] == "user":
+                        sess.history.pop()
                 for p in chunker.flush():
                     submit(p)
                 await emit_json({"type": "plan", "est_s": round(est_total[0], 2), "final": True})
