@@ -77,6 +77,26 @@ Qwen3-TTS 声音克隆模型在 **T4(Turing 架构,没有原生 bf16)上用 floa
 * 失败时界面直接显示真实原因和最近日志(不再只是一闪而过的提示)。
 * 自检:`CLONE_MOCK=1 python tests/e2e_numeric.py`(模拟 NaN 崩溃 → 自动降级 → 训练成功 → 对话可用)
 
+## v6 改动(「点开始训练卡在『正在上传参考音频』」+ 运行日志)
+
+### 根因
+截图里的现象:`已点击开始训练 · 正在上传参考音频(4683 KB)…`,进度条不动,顶部「连接 重连中」。旧版把整段录音(这里 4.6MB、1 分 10 秒)用**一个**请求经公网隧道(trycloudflare)上传,
+隧道对大请求很不稳定:慢、被中途掐断,而旧版超时 60 秒 × 重试 4 次,每次都从头重传,界面看起来就是「训练不了」。而且服务端最终只用前 20 秒,其余 50 秒白传、降噪还对整段 70 秒做。
+
+### 修复
+* 浏览器端先压缩:解码 → 单声道 → 24kHz → 最多 30 秒 → 16bit WAV(4.6MB → 约 1.4MB;解码失败时原文件照样上传,服务端用 ffmpeg)。
+* **分块上传**(`server/uploads.py`):192KB 一块、3 块并行、每块独立超时/重试(指数退避);已到达的块不重传(断点续传,再点一次「开始训练」会接着传);
+  全部到齐后发一个很小的 `POST /api/voice/train_uploaded`(幂等:响应丢了重发不会重复训练;缺块返回 422 + 缺失列表,前端自动补传)。界面实时显示 `上传 63% · 480 KB/s · 已自动重试 N 次`。
+* 旧接口 `/api/voice/train` 保留;新前端遇到旧服务端会自动退回一次性上传。
+* 降噪前先截断到 32 秒(旧版对整段降噪),训练 CPU 阶段更快。
+
+### 运行日志(顶部 📋 按钮,`server/perf.py`)
+* 服务端剖析每个环节:上传分块接收/拼装、解码、清洗、每张卡的声纹提取/合成校验、Whisper、相似度、训练各阶段、对话首声/LLM 首字 …… 次数 / 平均 / P95 / 最大。
+* **瓶颈分析**规则引擎:最慢训练阶段 + 建议、上传速度/重试、接口失败率与延迟、显存、首声、模型加载、磁盘。
+* 面板可复制 / 下载 .txt / .json / 「复制并打开 GitHub」(在 `logs/` 下新建文件提交即可)。接口:`GET /api/diag`(含 `perf` `analysis`)、`GET /api/perf`。
+* 自检:`CLONE_MOCK=1 python tests/e2e_upload.py`;真实浏览器(含模拟隧道丢包)`node tests/browser_e2e.js`。
+* 改过任何文件后运行 `python tools/build_all_in_one.py` 重新生成 `kaggle_all_in_one.py`。
+
 ## 文件
 
 ```
@@ -85,6 +105,8 @@ web/index.html 前端(单屏,无需滚动)
 kaggle/run.py  Kaggle 启动器(装依赖/下载模型/起服务/建公网隧道/看门狗)
 tests/         Mock 端到端自检 (CLONE_MOCK=1, 不需要 GPU):e2e_mock / e2e_fail / e2e_diag / e2e_numeric
 server/errors.py  数值异常识别 + 精度回退链(v5)
+server/perf.py + uploads.py  性能剖析/瓶颈分析 + 分块上传(v6)
+tools/build_all_in_one.py  重新生成 kaggle_all_in_one.py
 kaggle_all_in_one.py  粘贴到 Kaggle 单元格即可运行的完整脚本(内置以上全部文件)
 ```
 
