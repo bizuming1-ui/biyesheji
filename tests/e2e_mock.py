@@ -111,7 +111,7 @@ def test_audio_dsp():
 def main():
     test_chunker()
     test_audio_dsp()
-    env = dict(os.environ, CLONE_MOCK="1", LLM_BACKEND="local", CLONE_DATA=str(ROOT / "data_test"))
+    env = dict(os.environ, CLONE_MOCK="1", CLONE_DATA=str(ROOT / "data_test"))
     p = subprocess.Popen([sys.executable, "-m", "uvicorn", "server.app:app", "--port", str(PORT), "--no-access-log"], cwd=ROOT, env=env)
     try:
         c = httpx.Client(base_url=BASE, timeout=30)
