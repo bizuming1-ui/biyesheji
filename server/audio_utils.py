@@ -97,6 +97,7 @@ def preprocess_reference(x: np.ndarray, sr: int = SR, max_seconds: float = 20.0)
     x = x.astype(np.float32)
     x = x - float(np.mean(x))
     x = highpass(x, sr, 60.0)
+    x = x[: int((max_seconds + 12.0) * sr)]  # v6: 先截断再降噪(旧版对整段 70 秒录音降噪,最后却只用前 20 秒,白白浪费 CPU)
     q0 = analyze_quality(x, sr)
     if q0["snr_db"] < 28:
         try:
