@@ -13,6 +13,9 @@ import httpx
 import numpy as np
 import soundfile as sf
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from server.config import CODE_VERSION  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent.parent
 PORT = int(os.environ.get("TEST_PORT", "7863"))
 BASE = "http://127.0.0.1:%d" % PORT
@@ -43,7 +46,7 @@ def wait_job(c, n=120):
     return j
 
 
-env = dict(os.environ, CLONE_MOCK="1", LLM_BACKEND="local", PORT=str(PORT), CLONE_DATA=str(ROOT / "data_test_upload"), PYTHONUNBUFFERED="1")
+env = dict(os.environ, CLONE_MOCK="1", PORT=str(PORT), CLONE_DATA=str(ROOT / "data_test_upload"), PYTHONUNBUFFERED="1")
 p = subprocess.Popen([sys.executable, "-m", "uvicorn", "server.app:app", "--port", str(PORT), "--no-access-log"],
                      cwd=ROOT, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 try:
@@ -92,7 +95,7 @@ try:
     check("analysis present", len(an) > 0, an[:2])
     check("analysis flags slow upload", any(a["area"] == "上传" and a["level"] == "warn" for a in an), [a for a in an if a["area"] == "上传"])
     check("analysis names slowest training stage", any(a["area"] == "训练" and "最慢阶段" in a["msg"] for a in an), [a["msg"] for a in an][:4])
-    check("diag version v6", d["config"].get("CODE_VERSION") == "v8")
+    check("diag version == server.config.CODE_VERSION", d["config"].get("CODE_VERSION") == CODE_VERSION)
     pr = c.get("/api/perf").json()
     check("/api/perf", "summary" in pr and "recent" in pr)
     # 旧接口兼容
